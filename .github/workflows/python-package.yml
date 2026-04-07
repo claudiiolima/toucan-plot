@@ -1,7 +1,7 @@
 # This workflow will install Python dependencies, run tests and lint with a variety of Python versions
 # For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-python
 
-name: "TouCAN-Plot on Windows (Powershell)"
+name: "TouCAN-Plot"
 
 on:
   push:
@@ -52,6 +52,11 @@ jobs:
       run: |
         .\.venv\Scripts\activate
         uv build
+    - name: Upload dist artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: dist-windows
+        path: dist
 
   build-ubuntu:
     runs-on: ubuntu-latest
@@ -91,3 +96,54 @@ jobs:
       run: |
         source .venv/bin/activate
         uv build
+    - name: Upload dist artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: dist-ubuntu
+        path: dist
+
+  publish:
+    runs-on: ubuntu-latest
+    needs: [build-windows, build-ubuntu]
+    # Only publish on direct pushes to master (avoid publishing for PRs).
+    if: github.ref == 'refs/heads/master'
+
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Download Ubuntu dist artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: dist-ubuntu
+        path: dist-ubuntu
+
+    - name: Download Windows dist artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: dist-windows
+        path: dist-windows
+
+    - name: Merge dists
+      run: |
+        mkdir -p dist
+        # copy files from downloaded artifacts into a single dist/ folder
+        if [ -d dist-ubuntu ]; then cp -R dist-ubuntu/* dist/ || true; fi
+        if [ -d dist-windows ]; then cp -R dist-windows/* dist/ || true; fi
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.13'
+
+    - name: Install twine
+      run: |
+        python -m pip install --upgrade pip
+        pip install twine
+
+    - name: Publish to PyPI
+      env:
+        TWINE_USERNAME: __token__
+        TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+      run: |
+        # Upload everything in dist/ to PyPI using the API token stored in secrets.PYPI_API_TOKEN
+        python -m twine upload --non-interactive dist/*
