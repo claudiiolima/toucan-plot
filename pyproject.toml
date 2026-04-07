@@ -12,6 +12,7 @@ dependencies = [
     "scienceplots>=2.2.1",
     "python-can>=4.0",
     "cantools>=39.0",
+    "asammdf>=7.0",
 ]
 
 [project.scripts]

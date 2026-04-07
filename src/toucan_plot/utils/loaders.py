@@ -3,6 +3,7 @@ import csv
 import numpy as np
 import can
 import cantools
+from asammdf import MDF
 
 def detect_delimiter(path):
     with open(path, 'r') as f:
@@ -140,5 +141,79 @@ def can_log_load_worker(blf_path, dbc_paths, queue):
                 queue.put(('progress', pct, f'Processing signal {sig_idx + 1}/{total_signals}...'))
 
         queue.put(('result', ('Time', all_columns)))
+    except Exception as e:
+        queue.put(('error', str(e)))
+
+
+def mf4_load_worker(path, queue):
+    """Multiprocessing worker for MF4 loading via asammdf. Sends progress via queue."""
+    try:
+        queue.put(('progress', 5, 'Opening MF4 file...'))
+        mdf = MDF(path)
+
+        queue.put(('progress', 15, 'Extracting channels...'))
+        # Collect all non-empty numeric channels
+        channel_names = []
+        for i, group in enumerate(mdf.groups):
+            for j, channel in enumerate(group.channels):
+                name = channel.name
+                if name and name != 't':
+                    channel_names.append((name, i, j))
+
+        if not channel_names:
+            queue.put(('error', 'No channels found in MF4 file.'))
+            mdf.close()
+            return
+
+        queue.put(('progress', 25, f'Processing {len(channel_names)} channels...'))
+        all_columns = {}
+        x_col = None
+        total = len(channel_names)
+
+        for idx, (name, group_idx, ch_idx) in enumerate(channel_names):
+            try:
+                sig = mdf.get(name, group=group_idx, index=ch_idx)
+            except Exception:
+                continue
+
+            # Skip non-numeric or empty signals
+            if sig.samples.size == 0:
+                continue
+            if sig.samples.ndim != 1:
+                continue
+            if not np.issubdtype(sig.samples.dtype, np.number):
+                continue
+
+            timestamps = sig.timestamps
+            try:
+                samples = sig.samples.astype(float)
+            except (ValueError, TypeError):
+                continue
+
+            # Use the first valid channel's timestamps as x axis
+            if x_col is None:
+                x_col = 'Time'
+                all_columns['Time'] = timestamps
+
+            # If this channel's timestamps match the common time axis, use directly
+            common_t = all_columns['Time']
+            if len(timestamps) == len(common_t) and np.allclose(timestamps, common_t):
+                all_columns[name] = samples
+            else:
+                # Interpolate onto the common time axis
+                all_columns[name] = np.interp(common_t, timestamps, samples)
+
+            pct = 25 + int(70 * (idx + 1) / total)
+            if (idx + 1) % 20 == 0 or idx == total - 1:
+                queue.put(('progress', pct, f'Processing channel {idx + 1}/{total}...'))
+
+        mdf.close()
+
+        if x_col is None or len(all_columns) <= 1:
+            queue.put(('error', 'No numeric channels could be extracted from the MF4 file.'))
+            return
+
+        queue.put(('progress', 98, 'Finalizing...'))
+        queue.put(('result', (x_col, all_columns)))
     except Exception as e:
         queue.put(('error', str(e)))

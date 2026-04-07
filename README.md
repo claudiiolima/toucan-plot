@@ -12,6 +12,7 @@ An interactive PyQt6 + Matplotlib plotting tool for CSV, SMV, and CAN bus log fi
 | Format | Description |
 |--------|-------------|
 | `.csv` / `.smv` | Comma or semicolon delimited data (auto-detected) |
+| `.mf4` / `.mf4z` | ASAM MDF v4 measurement data (via asammdf) |
 | `.blf` | CAN bus binary log |
 | `.trc` | CAN bus trace log |
 | `.asc` | CAN bus ASCII log |
@@ -85,6 +86,9 @@ uv pip install .
 # Open a CSV file
 toucan-plot data.csv
 
+# Open an MF4 measurement file
+toucan-plot recording.mf4
+
 # Open a CAN log with DBC decoding
 toucan-plot recording.blf signals.dbc
 
@@ -105,6 +109,7 @@ toucan-plot
 - SciencePlots
 - python-can (for CAN log files)
 - cantools (for DBC decoding)
+- asammdf (for MF4 files)
 
 ## License
 
