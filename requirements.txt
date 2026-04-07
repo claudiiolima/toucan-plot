@@ -1,4 +1,0 @@
-PyQt6>=6.0
-matplotlib>=3.0
-numpy>=1.20
-pyqtdarktheme>=2.1.0

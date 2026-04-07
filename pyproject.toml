@@ -1,0 +1,21 @@
+[project]
+name = "toucan-plot"
+version = "0.1.0"
+description = "A versatile PyQt6 and Matplotlib-based plotting tool for CSV and SMV data files."
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = [
+    "pyqt6>=6.0",
+    "matplotlib>=3.0",
+    "numpy>=1.20",
+    "pyqtdarktheme>=2.1.0",
+    "scienceplots>=2.2.1",
+    "python-can>=4.0",
+    "cantools>=39.0",
+]
+
+[project.scripts]
+toucan-plot = "toucan_plot.main:main"
+
+[tool.setuptools.package-data]
+toucan_plot = ["assets/**/*.svg", "assets/**/*.ico"]
