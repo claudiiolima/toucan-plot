@@ -68,16 +68,12 @@ Four built-in presets: **Default**, **Style 1**, **IEEE**, **Other**.
 
 ## Installation
 
-### From source (recommended)
+### From PyPI (recommended)
+
+Install the released package from PyPI:
 
 ```shell
-pip install .
-```
-
-### With uv
-
-```shell
-uv pip install .
+pip install toucan-plot
 ```
 
 ## Usage
