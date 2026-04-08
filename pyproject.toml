@@ -21,3 +21,12 @@ toucan-plot = "toucan_plot.main:main"
 
 [tool.setuptools.package-data]
 toucan_plot = ["assets/**/*.svg", "assets/**/*.ico"]
+
+[dependency-groups]
+dev = [
+    "nuitka>=4.0.7",
+    "zstandard>=0.25.0",
+]
+lint = [
+    "ruff>=0.15.9",
+]

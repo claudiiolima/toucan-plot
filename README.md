@@ -9,14 +9,14 @@ An interactive PyQt6 + Matplotlib plotting tool for CSV, SMV, and CAN bus log fi
 
 ### Supported File Formats
 
-| Format | Description |
-|--------|-------------|
-| `.csv` / `.smv` | Comma or semicolon delimited data (auto-detected) |
-| `.mf4` / `.mf4z` | ASAM MDF v4 measurement data (via asammdf) |
-| `.blf` | CAN bus binary log |
-| `.trc` | CAN bus trace log |
-| `.asc` | CAN bus ASCII log |
-| `.dbc` | CAN database for signal decoding (required with BLF/TRC/ASC) |
+| Format           | Description                                                  |
+|------------------|--------------------------------------------------------------|
+| `.csv` / `.smv`  | Comma or semicolon delimited data (auto-detected)            |
+| `.mf4` / `.mf4z` | ASAM MDF v4 measurement data (via asammdf)                   |
+| `.blf`           | CAN bus binary log                                           |
+| `.trc`           | CAN bus trace log                                            |
+| `.asc`           | CAN bus ASCII log                                            |
+| `.dbc`           | CAN database for signal decoding (required with BLF/TRC/ASC) |
 
 - Auto-detects `Time` / `timestamp` columns as the default X axis
 - CAN signals are forward-fill interpolated and named as `Message.Signal`
@@ -35,18 +35,18 @@ An interactive PyQt6 + Matplotlib plotting tool for CSV, SMV, and CAN bus log fi
 
 ### Toolbar
 
-| Button | Action |
-|--------|--------|
-| Home | Auto-fit all axes |
-| Back / Forward | Navigate view history |
-| Pan | Pan mode |
-| Zoom | Zoom rectangle mode |
-| Customize | Matplotlib per-curve property editor |
-| Save | Export figure to file |
-| Add subplot | Open the series selector |
-| Fit Y | Auto-fit Y axis keeping current X range |
-| Measure | Toggle measure cursors |
-| X axis | Select X axis column |
+| Button         | Action                                  |
+|----------------|-----------------------------------------|
+| Home           | Auto-fit all axes                       |
+| Back / Forward | Navigate view history                   |
+| Pan            | Pan mode                                |
+| Zoom           | Zoom rectangle mode                     |
+| Customize      | Matplotlib per-curve property editor    |
+| Save           | Export figure to file                   |
+| Add subplot    | Open the series selector                |
+| Fit Y          | Auto-fit Y axis keeping current X range |
+| Measure        | Toggle measure cursors                  |
+| X axis         | Select X axis column                    |
 
 ### Menus
 

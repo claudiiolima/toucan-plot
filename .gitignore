@@ -1,6 +1,11 @@
 .venv/
 build/
 dist/
+
+toucan_plot.build/
+toucan_plot.dist/
+toucan_plot.onefile-build/
+
 **/__pycache__/
 **/*egg-info/
 **/*.csv
