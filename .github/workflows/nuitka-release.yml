@@ -58,7 +58,7 @@ jobs:
     - name: Distribute Executable
       run: |
         .\.venv\Scripts\activate
-        python -m nuitka --onefile --assume-yes-for-downloads --follow-imports --enable-plugin=pyqt6 --include-data-dir=src/toucan_plot/assets=assets --include-package=chardet --include-package-data=chardet --include-package=scienceplots --include-package-data=scienceplots src/toucan_plot/main.py --output-filename=dist/toucan-plot.exe
+        python -m nuitka --onefile --windows-disable-console --assume-yes-for-downloads --follow-imports --enable-plugin=pyqt6 --windows-icon-from-ico=src/toucan_plot/assets/ico/toucan-plot.ico --include-data-dir=src/toucan_plot/assets=assets --include-package=chardet --include-package-data=chardet --include-package=scienceplots --include-package-data=scienceplots src/toucan_plot/main.py --output-filename=dist/toucan-plot.exe
 
     - name: Create and Upload Release Assets
       uses: softprops/action-gh-release@v2
