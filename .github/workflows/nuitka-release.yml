@@ -46,7 +46,7 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install uv
-        uv venv .venv
+        uv venv .venv --python ${{ matrix.python-version }}
         .\.venv\Scripts\activate
         uv sync
 
