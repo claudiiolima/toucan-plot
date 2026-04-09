@@ -217,3 +217,41 @@ def mf4_load_worker(path, queue):
         queue.put(('result', (x_col, all_columns)))
     except Exception as e:
         queue.put(('error', str(e)))
+
+
+def feather_load_worker(path, queue):
+    """Multiprocessing worker for Feather loading via pandas. Sends progress via queue."""
+    try:
+        import pandas as pd
+
+        queue.put(('progress', 5, 'Reading Feather file...'))
+        df = pd.read_feather(path)
+
+        if df.empty:
+            queue.put(('error', 'Feather file is empty or has no data rows.'))
+            return
+
+        queue.put(('progress', 30, 'Building columns...'))
+        all_columns = {}
+        num_cols = len(df.columns)
+
+        x_col = None
+        for candidate in ('Time', 'timestamp', 'time'):
+            if candidate in df.columns:
+                x_col = candidate
+                break
+        if x_col is None:
+            x_col = df.columns[0]
+
+        for col_idx, col_name in enumerate(df.columns):
+            try:
+                all_columns[col_name] = df[col_name].to_numpy(dtype=float, na_value=np.nan)
+            except (ValueError, TypeError):
+                continue
+            pct = 30 + int(65 * (col_idx + 1) / num_cols)
+            queue.put(('progress', pct, f'Processing column {col_idx + 1}/{num_cols}...'))
+
+        queue.put(('progress', 98, 'Finalizing...'))
+        queue.put(('result', (x_col, all_columns)))
+    except Exception as e:
+        queue.put(('error', str(e)))

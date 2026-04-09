@@ -4,6 +4,7 @@ from .loaders import (
     csv_load_worker,
     can_log_load_worker,
     mf4_load_worker,
+    feather_load_worker,
 )
 
 __all__ = [
@@ -11,4 +12,5 @@ __all__ = [
     "csv_load_worker",
     "can_log_load_worker",
     "mf4_load_worker",
+    "feather_load_worker",
 ]

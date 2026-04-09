@@ -9,7 +9,7 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt import NavigationToolbar2QT as NavigationToolbar
 import qdarktheme
 
-from toucan_plot.utils import styles, csv_load_worker, can_log_load_worker, mf4_load_worker
+from toucan_plot.utils import styles, csv_load_worker, can_log_load_worker, mf4_load_worker, feather_load_worker
 
 LEGEND_POSITIONS = [
     'best', 'upper right', 'upper left', 'lower left', 'lower right',
@@ -687,6 +687,7 @@ class MainWindow(QtWidgets.QMainWindow):
         dbc_files = [p for p in paths if os.path.splitext(p)[1].lower() == '.dbc']
         csv_files = [p for p in paths if os.path.splitext(p)[1].lower() in ('.csv', '.smv')]
         mf4_files = [p for p in paths if os.path.splitext(p)[1].lower() in ('.mf4', '.mf4z')]
+        feather_files = [p for p in paths if os.path.splitext(p)[1].lower() == '.feather']
 
         first_loaded = False
 
@@ -715,19 +716,27 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._merged_mode = True
                 self._merge_load_mf4(path, os.path.basename(path))
 
+        for path in feather_files:
+            if not first_loaded:
+                self._load_feather(path)
+                first_loaded = True
+            else:
+                self._merged_mode = True
+                self._merge_load_feather(path, os.path.basename(path))
+
         if self._merged_mode and self.series_list:
             file_names = [f['name'] for f in self._loaded_files]
             self.update_plot()
             self.setWindowTitle(f'Toucan-Plot — Merged: {", ".join(file_names)}')
 
     def open_file(self):
-        file_filter = "All supported files (*.csv *.smv *.blf *.trc *.asc *.dbc *.mf4 *.mf4z);;CSV files (*.csv);;SMV files (*.smv);;MF4 files (*.mf4 *.mf4z);;CAN files (*.blf *.trc *.asc *.dbc);;All files (*)"
+        file_filter = "All supported files (*.csv *.smv *.blf *.trc *.asc *.dbc *.mf4 *.mf4z *.feather);;CSV files (*.csv *.smv);;MF4 files (*.mf4 *.mf4z);;Feather files (*.feather);;CAN files (*.blf *.trc *.asc *.dbc);;All files (*)"
         paths, _ = QtWidgets.QFileDialog.getOpenFileNames(self, 'Open File', '', file_filter)
         self.open_files(paths)
 
     def merge_file(self):
         """Open additional files and append their series to the existing plot session."""
-        file_filter = "All supported files (*.csv *.smv *.blf *.trc *.asc *.dbc *.mf4 *.mf4z);;CSV files (*.csv);;SMV files (*.smv);;MF4 files (*.mf4 *.mf4z);;CAN files (*.blf *.trc *.asc *.dbc);;All files (*)"
+        file_filter = "All supported files (*.csv *.smv *.blf *.trc *.asc *.dbc *.mf4 *.mf4z *.feather);;CSV files (*.csv *.smv);;MF4 files (*.mf4 *.mf4z);;Feather files (*.feather);;CAN files (*.blf *.trc *.asc *.dbc);;All files (*)"
         paths, _ = QtWidgets.QFileDialog.getOpenFileNames(self, 'Merge Files', '', file_filter)
         if not paths:
             return
@@ -738,6 +747,7 @@ class MainWindow(QtWidgets.QMainWindow):
         dbc_files = [p for p in paths if os.path.splitext(p)[1].lower() == '.dbc']
         csv_files = [p for p in paths if os.path.splitext(p)[1].lower() in ('.csv', '.smv')]
         mf4_files = [p for p in paths if os.path.splitext(p)[1].lower() in ('.mf4', '.mf4z')]
+        feather_files = [p for p in paths if os.path.splitext(p)[1].lower() == '.feather']
 
         for path in csv_files:
             basename = os.path.basename(path)
@@ -751,6 +761,10 @@ class MainWindow(QtWidgets.QMainWindow):
         for path in mf4_files:
             basename = os.path.basename(path)
             self._merge_load_mf4(path, basename)
+
+        for path in feather_files:
+            basename = os.path.basename(path)
+            self._merge_load_feather(path, basename)
 
         if self.series_list:
             file_names = [f['name'] for f in self._loaded_files]
@@ -1141,6 +1155,153 @@ class MainWindow(QtWidgets.QMainWindow):
         """Load an MF4 file and append its series (prefixed) to the existing series_list."""
         queue = multiprocessing.Queue()
         proc = multiprocessing.Process(target=mf4_load_worker, args=(path, queue))
+
+        progress = QtWidgets.QProgressDialog(f'Loading {os.path.basename(path)}...', None, 0, 100, self)
+        progress.setWindowTitle('Loading')
+        progress.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+
+        result_data = {}
+
+        def poll():
+            try:
+                while not queue.empty():
+                    msg = queue.get_nowait()
+                    if msg[0] == 'progress':
+                        pct = msg[1]
+                        label = msg[2] if len(msg) > 2 else ''
+                        if pct >= 0:
+                            progress.setValue(pct)
+                        if label:
+                            progress.setLabelText(label)
+                    elif msg[0] == 'result':
+                        result_data['data'] = msg[1]
+                        progress.setValue(100)
+                        progress.close()
+                    elif msg[0] == 'error':
+                        result_data['error'] = msg[1]
+                        progress.close()
+            except Exception:
+                pass
+
+        timer = QtCore.QTimer(progress)
+        timer.timeout.connect(poll)
+        timer.start(50)
+        proc.start()
+        progress.exec()
+        timer.stop()
+        proc.join(timeout=10)
+
+        if 'error' in result_data:
+            QtWidgets.QMessageBox.warning(self, 'Error', result_data['error'])
+            return
+        if 'data' not in result_data:
+            return
+
+        x_col, all_columns = result_data['data']
+        x_array = all_columns[x_col]
+
+        if len(self.series_list) == 0:
+            self._x = x_array
+            self._x_col_name = x_col
+
+        file_entry = {'name': prefix, 'series_indices': []}
+        for name in all_columns:
+            if name == x_col:
+                continue
+            data = all_columns[name]
+            prefixed_name = f'{prefix}: {name}'
+            idx = len(self.series_list)
+            self.series_list.append((prefixed_name, lambda x, f, _d=data: _d, x_array))
+            file_entry['series_indices'].append(idx)
+        self._loaded_files.append(file_entry)
+
+    def _load_feather(self, path):
+        """Load a Feather file using a worker process with live progress."""
+        queue = multiprocessing.Queue()
+        proc = multiprocessing.Process(target=feather_load_worker, args=(path, queue))
+
+        progress = QtWidgets.QProgressDialog(f'Loading {os.path.basename(path)}...', None, 0, 100, self)
+        progress.setWindowTitle('Loading')
+        progress.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+
+        result_data = {}
+
+        def poll():
+            try:
+                while not queue.empty():
+                    msg = queue.get_nowait()
+                    if msg[0] == 'progress':
+                        pct = msg[1]
+                        label = msg[2] if len(msg) > 2 else ''
+                        if pct >= 0:
+                            progress.setValue(pct)
+                        if label:
+                            progress.setLabelText(label)
+                    elif msg[0] == 'result':
+                        result_data['data'] = msg[1]
+                        progress.setValue(100)
+                        progress.close()
+                    elif msg[0] == 'error':
+                        result_data['error'] = msg[1]
+                        progress.close()
+            except Exception:
+                pass
+
+        timer = QtCore.QTimer(progress)
+        timer.timeout.connect(poll)
+        timer.start(50)
+        proc.start()
+        progress.exec()
+        timer.stop()
+        proc.join(timeout=10)
+
+        if 'error' in result_data:
+            QtWidgets.QMessageBox.warning(self, 'Error', result_data['error'])
+            return
+        if 'data' not in result_data:
+            return
+
+        x_col, all_columns = result_data['data']
+        x_array = all_columns[x_col]
+
+        self._x = x_array
+        self._all_columns = all_columns
+        self._x_col_name = x_col
+        self._merged_mode = False
+
+        # Clear existing series and subplots
+        self.series_list.clear()
+        self.subplot_series.clear()
+        self.subplot_series_props.clear()
+        self.subplot_axes_labels.clear()
+        self.subplot_config.clear()
+        self._loaded_files.clear()
+
+        # Build series_list from all_columns
+        basename = os.path.basename(path)
+        file_entry = {'name': basename, 'series_indices': []}
+        for name in all_columns:
+            if name == x_col:
+                continue
+            data = all_columns[name]
+            idx = len(self.series_list)
+            self.series_list.append((name, lambda x, f, _d=data: _d, x_array))
+            file_entry['series_indices'].append(idx)
+        self._loaded_files.append(file_entry)
+        self._merge_action.setEnabled(True)
+
+        self.update_plot()
+        self.setWindowTitle(f'Toucan-Plot — {basename}')
+        self.show_series_selector()
+
+    def _merge_load_feather(self, path, prefix):
+        """Load a Feather file and append its series (prefixed) to the existing series_list."""
+        queue = multiprocessing.Queue()
+        proc = multiprocessing.Process(target=feather_load_worker, args=(path, queue))
 
         progress = QtWidgets.QProgressDialog(f'Loading {os.path.basename(path)}...', None, 0, 100, self)
         progress.setWindowTitle('Loading')
