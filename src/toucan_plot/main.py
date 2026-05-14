@@ -122,12 +122,6 @@ class MainWindow(QtWidgets.QMainWindow):
         unwanted_buttons = ["Subplots"]
         plot_widget = QtWidgets.QWidget()
         self.nav_toolbar = NavigationToolbar(self.canvas, self, coordinates=False)
-        # Override edit_parameters so update_plot runs after the Customize dialog closes
-        _orig_edit_parameters = self.nav_toolbar.edit_parameters
-        def _custom_edit_parameters():
-            _orig_edit_parameters()
-            self.update_plot()
-        self.nav_toolbar.edit_parameters = _custom_edit_parameters
         # Override the Home button to auto-fit all series data
         for action in self.nav_toolbar.actions():
             if action.text() in unwanted_buttons:
@@ -137,6 +131,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 icon_path = self._icons_buttons[action.text()][self._current_theme]
                 if os.path.exists(icon_path):
                     action.setIcon(QtGui.QIcon(icon_path))
+            if action.text() == 'Customize':
+                try:
+                    action.triggered.disconnect()
+                except Exception:
+                    pass
+                action.triggered.connect(self._on_customize_action)
             if action.text() == 'Home':
                 action.triggered.disconnect()
                 action.triggered.connect(self._home_autoscale)
@@ -200,7 +200,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Default style used when creating/updating subplot configuration
         self.default_plot_style = {
             'legend_show': True,
-            'legend_pos': 'best',
+            'legend_pos': 'upper right',
             'legend_orient': 'vertical',
             'legend_fontsize': 12,
             'plot_mode': 'step',
@@ -217,10 +217,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.available_plot_presets[self.selected_plot_preset]()
 
         # Prepare series definitions (5 series). x is shared.
-        self._x = np.linspace(0, 2 * np.pi, 400)
         self._all_columns = {}  # all loaded columns (name -> numpy array)
         self._x_col_name = ''  # current x-axis column name
         self._skip_xlabel_capture = False  # flag to skip xlabel capture during x-axis change
+        self._skip_runtime_style_capture = False  # skip line style capture during explicit dialog applies
         self._merged_mode = False  # True when multiple files are merged
         # Tracks loaded files: list of {'name': str, 'series_indices': [int, ...]}
         self._loaded_files = []
@@ -235,6 +235,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.subplot_series_props = []
         # Per-subplot axes labels: a list of dicts with keys 'xlabel','ylabel_primary','ylabel_secondary'
         self.subplot_axes_labels = []
+        # Per-subplot y-axis settings: a list of dicts {yaxis_id: {'label', 'scale', 'y_min', 'y_max'}}
+        self.subplot_yaxis_settings = []
         # Per-subplot display config: legend and plot mode
         # Each entry is a dict: {'legend_show': bool, 'legend_pos': str, 'legend_orient': str, 'plot_mode': str}
         self.subplot_config = []
@@ -248,10 +250,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self._measure_dialog = None
         self._plotted_line_artists = []  # stored line artists per subplot for property capture
         self._plotted_series_snapshot = []  # snapshot of subplot_series at last draw (for structure matching)
+        self._subplot_axes_map = []  # runtime map: subplot index -> {yaxis_id: matplotlib axis}
+        self._axis_pan_state = None
 
         # Connect matplotlib double-clicks on the canvas to allow adding series to a clicked subplot
         # Use mpl_connect to listen for mouse button press events; event.dblclick indicates a double-click.
         self.canvas.mpl_connect('button_press_event', self.on_canvas_click)
+        self.canvas.mpl_connect('button_press_event', self._axis_pan_press)
+        self.canvas.mpl_connect('motion_notify_event', self._axis_pan_move)
+        self.canvas.mpl_connect('button_release_event', self._axis_pan_release)
 
         # initial plot
         self.update_plot()
@@ -275,9 +282,11 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.subplot_axes_labels[i]['xlabel'] = current_xlabel
                 if current_ylabel:
                     self.subplot_axes_labels[i]['ylabel_primary'] = current_ylabel
+            self._capture_subplot_yaxis_runtime_state(i)
             # Capture series properties (label, color, linewidth, linestyle, marker) from stored line artists
             # Only capture if this subplot's structure hasn't changed since last draw
-            if (i < len(self._plotted_line_artists)
+            if (not self._skip_runtime_style_capture
+                    and i < len(self._plotted_line_artists)
                     and i < len(self._plotted_series_snapshot)
                     and i < len(self.subplot_series)
                     and self._plotted_series_snapshot[i] == self.subplot_series[i]):
@@ -321,14 +330,17 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Keep a reference to current axes so we can map mouse events to subplot indices
         self.current_axes = axes
+        self._subplot_axes_map = []
 
         # Plot each subplot's series
         for idx, series_indices in enumerate(self.subplot_series):
             ax = axes[idx]
+            axis_by_id = {1: ax}
             # retrieve axis labels for this subplot if any
             ax_labels = {'xlabel': '', 'ylabel_primary': '', 'ylabel_secondary': ''}
             if idx < len(self.subplot_axes_labels):
                 ax_labels.update(self.subplot_axes_labels[idx])
+            yaxis_settings = self._get_subplot_yaxis_settings(idx)
             props_list = []
             if idx < len(self.subplot_series_props):
                 props_list = self.subplot_series_props[idx]
@@ -348,6 +360,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 if j < len(props_list):
                     p = props_list[j]
                     color = p.get('color', '')
+                    color = self._parse_color_value(color)
                     lw = p.get('linewidth', 1.5)
                     ls = p.get('linestyle', '')
                     marker = p.get('marker', '')
@@ -375,7 +388,25 @@ class MainWindow(QtWidgets.QMainWindow):
                     draw_kwargs['color'] = color
                 target_ax = ax
                 if yaxis != 1:
-                    target_ax = ax.twinx()
+                    if yaxis in axis_by_id:
+                        target_ax = axis_by_id[yaxis]
+                    else:
+                        target_ax = ax.twinx()
+                        axis_by_id[yaxis] = target_ax
+                        # Match secondary axis visual style to the primary axis.
+                        primary_tick_color = ax.spines['left'].get_edgecolor()
+                        target_ax.spines['right'].set_color(primary_tick_color)
+                        target_ax.tick_params(axis='y', colors=primary_tick_color)
+                        target_ax.yaxis.label.set_color(primary_tick_color)
+                        target_ax.patch.set_visible(False)
+                        secondary_count = len(axis_by_id) - 1
+                        if secondary_count > 1:
+                            target_ax.spines['right'].set_position(('axes', 1.0 + 0.1 * (secondary_count - 1)))
+                            target_ax.set_frame_on(True)
+                            target_ax.patch.set_visible(False)
+                            for spine_name, spine in target_ax.spines.items():
+                                if spine_name != 'right':
+                                    spine.set_visible(False)
                 if plot_fn_name == 'step':
                     step_result = target_ax.step(x_data, y, where='post', **draw_kwargs)
                     subplot_line_artists.append(step_result[0])
@@ -383,13 +414,30 @@ class MainWindow(QtWidgets.QMainWindow):
                     plot_result = target_ax.plot(x_data, y, **draw_kwargs)
                     subplot_line_artists.append(plot_result[0])
                 if yaxis != 1:
-                    ax_ylabel_secondary = ax_labels.get('ylabel_secondary')
-                    if ax_ylabel_secondary:
-                        target_ax.set_ylabel(ax_ylabel_secondary, fontsize=axis_text_size)
                     target_ax.tick_params(axis='both', labelsize=axis_text_size)
             self._plotted_line_artists.append(subplot_line_artists)
+            for yaxis_id, axis_obj in axis_by_id.items():
+                settings = dict(self._make_default_yaxis_settings(yaxis_id))
+                settings.update(yaxis_settings.get(yaxis_id, {}))
+                if yaxis_id == 1 and not settings.get('label'):
+                    settings['label'] = ax_labels.get('ylabel_primary', '')
+                elif yaxis_id != 1 and not settings.get('label'):
+                    settings['label'] = ax_labels.get('ylabel_secondary', '')
+                label_text = settings.get('label', '')
+                if label_text:
+                    axis_obj.set_ylabel(label_text, fontsize=axis_text_size)
+                scale_name = settings.get('scale', 'linear')
+                if scale_name:
+                    axis_obj.set_yscale(scale_name)
+                y_min = settings.get('y_min')
+                y_max = settings.get('y_max')
+                if y_min is not None and y_max is not None:
+                    try:
+                        axis_obj.set_ylim(float(y_min), float(y_max))
+                    except Exception:
+                        pass
+                axis_obj.tick_params(axis='y', labelsize=axis_text_size)
             # Configure axis
-            ax_xlabel = ax_labels.get('xlabel')
             ax_ylabel = ax_labels.get('ylabel_primary')
             # X label only on the last subplot
             if idx == nsubs - 1:
@@ -412,6 +460,32 @@ class MainWindow(QtWidgets.QMainWindow):
                 ncol = len(series_indices) if cfg.get('legend_orient') == 'horizontal' else 1
                 legend_fs = cfg.get('legend_fontsize', self.default_plot_style['legend_fontsize'])
                 legend_pos = cfg.get('legend_pos', 'best')
+                legend_handles = []
+                legend_labels = []
+                # Build legend from plotted lines for this subplot so it always
+                # includes all series across every y-axis after Figure Options edits.
+                for line_idx, line in enumerate(subplot_line_artists):
+                    label = line.get_label()
+                    if not label or label.startswith('_'):
+                        if line_idx < len(series_indices):
+                            series_idx = series_indices[line_idx]
+                            if 0 <= series_idx < len(self.series_list):
+                                label = self.series_list[series_idx][0]
+                    if not label or str(label).startswith('_'):
+                        continue
+                    legend_handles.append(line)
+                    legend_labels.append(label)
+
+                if not legend_handles:
+                    # Fallback: ask each axis for legendable artists if all line labels are hidden.
+                    for axis_obj in axis_by_id.values():
+                        handles_axis, labels_axis = axis_obj.get_legend_handles_labels()
+                        for handle, lbl in zip(handles_axis, labels_axis):
+                            if lbl and not str(lbl).startswith('_'):
+                                legend_handles.append(handle)
+                                legend_labels.append(lbl)
+                # Draw legend on the top-most axis so it stays above twinx plots.
+                legend_axis = next(reversed(axis_by_id.values()))
                 outside_map = {
                     'outside right':        ('upper left',   (1.02, 1)),
                     'outside left':         ('upper right',  (-0.02, 1)),
@@ -421,9 +495,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 }
                 if legend_pos in outside_map:
                     loc, bbox = outside_map[legend_pos]
-                    ax.legend(loc=loc, bbox_to_anchor=bbox, borderaxespad=0, ncol=ncol, fontsize=legend_fs)
+                    legend = legend_axis.legend(legend_handles, legend_labels, loc=loc, bbox_to_anchor=bbox, borderaxespad=0, ncol=ncol, fontsize=legend_fs)
                 else:
-                    ax.legend(loc=legend_pos, ncol=ncol, fontsize=legend_fs)
+                    legend = legend_axis.legend(legend_handles, legend_labels, loc=legend_pos, ncol=ncol, fontsize=legend_fs)
+                legend.set_zorder(1000)
+                legend.get_frame().set_alpha(1.0)
+
+            self._subplot_axes_map.append(dict(axis_by_id))
 
             # Restore saved axis limits if available for this subplot
             if idx < len(saved_limits):
@@ -437,9 +515,363 @@ class MainWindow(QtWidgets.QMainWindow):
             self._update_measure_dialog()
         self.canvas.draw()
 
-    def on_randomize(self):
-        # Randomize button removed; keep method no-op in case called elsewhere
-        pass
+    def _make_default_yaxis_settings(self, yaxis_id=1):
+        return {
+            'label': '',
+            'scale': 'linear',
+            'y_min': None,
+            'y_max': None,
+        }
+
+    def _ensure_subplot_yaxis_settings(self, subplot_idx):
+        while len(self.subplot_yaxis_settings) <= subplot_idx:
+            self.subplot_yaxis_settings.append({1: self._make_default_yaxis_settings(1)})
+
+    def _get_subplot_yaxis_settings(self, subplot_idx):
+        self._ensure_subplot_yaxis_settings(subplot_idx)
+        settings = self.subplot_yaxis_settings[subplot_idx]
+        normalized = {}
+        for key, value in settings.items():
+            try:
+                yaxis_id = int(key)
+            except (TypeError, ValueError):
+                continue
+            axis_settings = dict(self._make_default_yaxis_settings(yaxis_id))
+            if isinstance(value, dict):
+                axis_settings.update(value)
+            normalized[yaxis_id] = axis_settings
+        if 1 not in normalized:
+            normalized[1] = self._make_default_yaxis_settings(1)
+        self.subplot_yaxis_settings[subplot_idx] = normalized
+        return normalized
+
+    def _capture_subplot_yaxis_runtime_state(self, subplot_idx):
+        if subplot_idx >= len(self._subplot_axes_map):
+            return
+        axis_map = self._subplot_axes_map[subplot_idx]
+        settings = self._get_subplot_yaxis_settings(subplot_idx)
+        for yaxis_id, axis_obj in axis_map.items():
+            axis_settings = dict(self._make_default_yaxis_settings(yaxis_id))
+            axis_settings.update(settings.get(yaxis_id, {}))
+            axis_settings['label'] = axis_obj.get_ylabel() or axis_settings.get('label', '')
+            axis_settings['scale'] = axis_obj.get_yscale() or axis_settings.get('scale', 'linear')
+            y_min, y_max = axis_obj.get_ylim()
+            axis_settings['y_min'] = float(y_min)
+            axis_settings['y_max'] = float(y_max)
+            settings[yaxis_id] = axis_settings
+        if subplot_idx < len(self.subplot_axes_labels):
+            self.subplot_axes_labels[subplot_idx]['ylabel_primary'] = settings.get(1, {}).get('label', '')
+            secondary_ids = sorted(y_id for y_id in settings if y_id != 1)
+            self.subplot_axes_labels[subplot_idx]['ylabel_secondary'] = settings.get(secondary_ids[0], {}).get('label', '') if secondary_ids else ''
+
+    def _on_customize_action(self):
+        self._show_subplot_options_dialog()
+
+    def _show_subplot_options_dialog(self):
+        axes = list(getattr(self, 'current_axes', []))
+        if not axes:
+            QtWidgets.QMessageBox.information(self, 'Customize subplot', 'There are no subplots to edit.')
+            return
+
+        subplot_idx = 0
+        if len(axes) > 1:
+            titles = []
+            for idx, ax in enumerate(axes):
+                title = ax.get_title() or ax.get_ylabel() or ax.get_xlabel() or f'Subplot {idx + 1}'
+                titles.append(f'{idx + 1}: {title}')
+            selected_title, ok = QtWidgets.QInputDialog.getItem(
+                self,
+                'Customize subplot',
+                'Select subplot:',
+                titles,
+                0,
+                False,
+            )
+            if not ok or not selected_title:
+                return
+            subplot_idx = titles.index(selected_title)
+
+        while len(self.subplot_axes_labels) <= subplot_idx:
+            self.subplot_axes_labels.append({'xlabel': '', 'ylabel_primary': '', 'ylabel_secondary': ''})
+        while len(self.subplot_yaxis_settings) <= subplot_idx:
+            self.subplot_yaxis_settings.append({1: self._make_default_yaxis_settings(1)})
+        while len(self.subplot_config) <= subplot_idx:
+            self.subplot_config.append(self._make_default_subplot_config())
+        while len(self.subplot_series_props) <= subplot_idx:
+            self.subplot_series_props.append([])
+
+        axis_obj = axes[subplot_idx]
+        labels_state = dict(self.subplot_axes_labels[subplot_idx])
+        cfg_state = dict(self.default_plot_style)
+        cfg_state.update(self.subplot_config[subplot_idx])
+        series_indices = list(self.subplot_series[subplot_idx]) if subplot_idx < len(self.subplot_series) else []
+        yaxis_settings_state = {}
+        available_yaxis_ids = {1}
+        for props in self.subplot_series_props[subplot_idx]:
+            available_yaxis_ids.add(int(props.get('yaxis', 1)))
+        if subplot_idx < len(self._subplot_axes_map):
+            available_yaxis_ids.update(int(y_id) for y_id in self._subplot_axes_map[subplot_idx].keys())
+        existing_yaxis_settings = self._get_subplot_yaxis_settings(subplot_idx)
+        axis_map_runtime = self._subplot_axes_map[subplot_idx] if subplot_idx < len(self._subplot_axes_map) else {1: axis_obj}
+        for yaxis_id in sorted(available_yaxis_ids):
+            axis_settings = dict(self._make_default_yaxis_settings(yaxis_id))
+            axis_settings.update(existing_yaxis_settings.get(yaxis_id, {}))
+            runtime_axis = axis_map_runtime.get(yaxis_id)
+            if runtime_axis is not None:
+                axis_settings['label'] = runtime_axis.get_ylabel() or axis_settings.get('label', '')
+                axis_settings['scale'] = runtime_axis.get_yscale() or axis_settings.get('scale', 'linear')
+                runtime_ymin, runtime_ymax = runtime_axis.get_ylim()
+                axis_settings['y_min'] = float(runtime_ymin)
+                axis_settings['y_max'] = float(runtime_ymax)
+            yaxis_settings_state[yaxis_id] = axis_settings
+        props_state = []
+        for row_idx, series_idx in enumerate(series_indices):
+            if row_idx < len(self.subplot_series_props[subplot_idx]):
+                props = dict(self.subplot_series_props[subplot_idx][row_idx])
+            else:
+                props = {
+                    'label': self.series_list[series_idx][0],
+                    'color': '',
+                    'linewidth': 1.5,
+                    'linestyle': '',
+                    'marker': '',
+                    'yaxis': 1,
+                }
+            props_state.append(props)
+
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle(f'Customize subplot {subplot_idx + 1}')
+        dlg.resize(760, 560)
+        main_layout = QtWidgets.QVBoxLayout(dlg)
+
+        form_widget = QtWidgets.QWidget()
+        form_layout = QtWidgets.QFormLayout(form_widget)
+
+        xlabel_edit = QtWidgets.QLineEdit(labels_state.get('xlabel', ''))
+        xlim = axis_obj.get_xlim()
+        x_min_edit = QtWidgets.QLineEdit(repr(float(xlim[0])))
+        x_max_edit = QtWidgets.QLineEdit(repr(float(xlim[1])))
+        x_scale_combo = QtWidgets.QComboBox()
+        x_scale_combo.addItems(['linear', 'log', 'symlog', 'logit'])
+        x_scale_combo.setCurrentText(axis_obj.get_xscale())
+
+        yaxis_selector = QtWidgets.QComboBox()
+        for yaxis_id in sorted(yaxis_settings_state.keys()):
+            yaxis_selector.addItem(f'Y{yaxis_id}', yaxis_id)
+        ylabel_edit = QtWidgets.QLineEdit()
+        y_min_edit = QtWidgets.QLineEdit()
+        y_max_edit = QtWidgets.QLineEdit()
+        y_scale_combo = QtWidgets.QComboBox()
+        y_scale_combo.addItems(['linear', 'log', 'symlog', 'logit'])
+        current_yaxis_id = {'value': int(yaxis_selector.currentData()) if yaxis_selector.count() else 1}
+
+        def load_selected_yaxis_fields():
+            yaxis_id = int(yaxis_selector.currentData()) if yaxis_selector.count() else 1
+            current_yaxis_id['value'] = yaxis_id
+            axis_settings = yaxis_settings_state.get(yaxis_id, self._make_default_yaxis_settings(yaxis_id))
+            ylabel_edit.setText(str(axis_settings.get('label', '')))
+            y_min = axis_settings.get('y_min')
+            y_max = axis_settings.get('y_max')
+            y_min_edit.setText('' if y_min is None else repr(float(y_min)))
+            y_max_edit.setText('' if y_max is None else repr(float(y_max)))
+            y_scale_combo.setCurrentText(str(axis_settings.get('scale', 'linear')))
+
+        def store_selected_yaxis_fields():
+            yaxis_id = current_yaxis_id['value']
+            axis_settings = dict(self._make_default_yaxis_settings(yaxis_id))
+            axis_settings.update(yaxis_settings_state.get(yaxis_id, {}))
+            axis_settings['label'] = ylabel_edit.text().strip()
+            axis_settings['scale'] = y_scale_combo.currentText()
+            axis_settings['y_min'] = self._parse_float(y_min_edit.text().strip(), None)
+            axis_settings['y_max'] = self._parse_float(y_max_edit.text().strip(), None)
+            yaxis_settings_state[yaxis_id] = axis_settings
+
+        def on_yaxis_changed(_index):
+            store_selected_yaxis_fields()
+            load_selected_yaxis_fields()
+
+        yaxis_selector.currentIndexChanged.connect(on_yaxis_changed)
+        load_selected_yaxis_fields()
+
+        legend_show_check = QtWidgets.QCheckBox('Show legend')
+        legend_show_check.setChecked(bool(cfg_state.get('legend_show', True)))
+        legend_pos_combo = QtWidgets.QComboBox()
+        legend_pos_combo.addItems(LEGEND_POSITIONS)
+        legend_pos_combo.setCurrentText(cfg_state.get('legend_pos', 'upper right'))
+        legend_orient_combo = QtWidgets.QComboBox()
+        legend_orient_combo.addItems(['vertical', 'horizontal'])
+        legend_orient_combo.setCurrentText(cfg_state.get('legend_orient', 'vertical'))
+        legend_fontsize_spin = QtWidgets.QSpinBox()
+        legend_fontsize_spin.setRange(6, 24)
+        legend_fontsize_spin.setValue(int(cfg_state.get('legend_fontsize', 12)))
+        regenerate_labels_check = QtWidgets.QCheckBox('Regenerate legend labels from series names')
+        regenerate_labels_check.setChecked(False)
+
+        form_layout.addRow('X label', xlabel_edit)
+        form_layout.addRow('X min', x_min_edit)
+        form_layout.addRow('X max', x_max_edit)
+        form_layout.addRow('Y axis target', yaxis_selector)
+        form_layout.addRow('Y label', ylabel_edit)
+        form_layout.addRow('Y min', y_min_edit)
+        form_layout.addRow('Y max', y_max_edit)
+        form_layout.addRow('X scale', x_scale_combo)
+        form_layout.addRow('Y scale', y_scale_combo)
+        form_layout.addRow('', legend_show_check)
+        form_layout.addRow('Legend position', legend_pos_combo)
+        form_layout.addRow('Legend orientation', legend_orient_combo)
+        form_layout.addRow('Legend font size', legend_fontsize_spin)
+        form_layout.addRow('', regenerate_labels_check)
+        main_layout.addWidget(form_widget)
+
+        curves_group = QtWidgets.QGroupBox('Curves')
+        curves_layout = QtWidgets.QVBoxLayout(curves_group)
+        curves_list = QtWidgets.QListWidget()
+        curves_layout.addWidget(curves_list)
+        curves_buttons = QtWidgets.QHBoxLayout()
+        edit_curve_btn = QtWidgets.QPushButton('Edit selected curve...')
+        curves_buttons.addWidget(edit_curve_btn)
+        curves_buttons.addStretch(1)
+        curves_layout.addLayout(curves_buttons)
+        main_layout.addWidget(curves_group, stretch=1)
+
+        def refresh_curves_list():
+            curves_list.clear()
+            for row_idx, series_idx in enumerate(series_indices):
+                name = self.series_list[series_idx][0]
+                props = props_state[row_idx] if row_idx < len(props_state) else {}
+                label = props.get('label', name)
+                yaxis_val = int(props.get('yaxis', 1))
+                curves_list.addItem(f'[Y{yaxis_val}] {label}  <-  {name}')
+
+        def edit_selected_curve():
+            row_idx = curves_list.currentRow()
+            if row_idx < 0 or row_idx >= len(series_indices):
+                QtWidgets.QMessageBox.information(dlg, 'Curve', 'Select one curve first.')
+                return
+
+            series_idx = series_indices[row_idx]
+            props = props_state[row_idx]
+            curve_dlg = QtWidgets.QDialog(dlg)
+            curve_dlg.setWindowTitle('Edit curve')
+            curve_layout = QtWidgets.QFormLayout(curve_dlg)
+
+            label_edit = QtWidgets.QLineEdit(str(props.get('label', self.series_list[series_idx][0])))
+            color_edit = QtWidgets.QLineEdit(str(props.get('color', '')))
+            color_btn = QtWidgets.QPushButton('Pick color...')
+            color_row = QtWidgets.QHBoxLayout()
+            color_row.addWidget(color_edit)
+            color_row.addWidget(color_btn)
+            width_spin = QtWidgets.QDoubleSpinBox()
+            width_spin.setRange(0.1, 20.0)
+            width_spin.setDecimals(2)
+            width_spin.setSingleStep(0.1)
+            width_spin.setValue(float(props.get('linewidth', 1.5)))
+            linestyle_combo = QtWidgets.QComboBox()
+            linestyle_combo.addItems(['', '-', '--', '-.', ':'])
+            linestyle_combo.setCurrentText(str(props.get('linestyle', '')))
+            marker_combo = QtWidgets.QComboBox()
+            marker_combo.addItems(['', 'o', 's', '^', 'v', 'x', '+', '*', '.', 'D', '|', '_'])
+            marker_combo.setCurrentText(str(props.get('marker', '')))
+            yaxis_label = QtWidgets.QLabel(f'Y{int(props.get("yaxis", 1))}')
+
+            def pick_color():
+                initial = QtGui.QColor(str(color_edit.text())) if color_edit.text() else QtGui.QColor('#ffffff')
+                color = QtWidgets.QColorDialog.getColor(initial, curve_dlg, 'Select curve color')
+                if color.isValid():
+                    color_edit.setText(color.name(QtGui.QColor.NameFormat.HexRgb))
+
+            color_btn.clicked.connect(pick_color)
+
+            curve_layout.addRow('Series', QtWidgets.QLabel(self.series_list[series_idx][0]))
+            curve_layout.addRow('Legend label', label_edit)
+            curve_layout.addRow('Assigned axis', yaxis_label)
+            curve_layout.addRow('Color', color_row)
+            curve_layout.addRow('Width', width_spin)
+            curve_layout.addRow('Line style', linestyle_combo)
+            curve_layout.addRow('Marker', marker_combo)
+            curve_buttons = QtWidgets.QDialogButtonBox(
+                QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel
+            )
+            curve_layout.addRow(curve_buttons)
+
+            def accept_curve():
+                props['label'] = label_edit.text().strip() or self.series_list[series_idx][0]
+                props['color'] = self._parse_color_value(color_edit.text().strip())
+                props['linewidth'] = float(width_spin.value())
+                props['linestyle'] = linestyle_combo.currentText()
+                props['marker'] = marker_combo.currentText()
+                refresh_curves_list()
+                curve_dlg.accept()
+
+            curve_buttons.accepted.connect(accept_curve)
+            curve_buttons.rejected.connect(curve_dlg.reject)
+            curve_dlg.exec()
+
+        edit_curve_btn.clicked.connect(edit_selected_curve)
+        curves_list.itemDoubleClicked.connect(lambda _item: edit_selected_curve())
+        refresh_curves_list()
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok |
+            QtWidgets.QDialogButtonBox.StandardButton.Cancel |
+            QtWidgets.QDialogButtonBox.StandardButton.Apply
+        )
+        main_layout.addWidget(buttons)
+
+        def apply_subplot_changes():
+            store_selected_yaxis_fields()
+            labels_state['xlabel'] = xlabel_edit.text().strip()
+            labels_state['ylabel_primary'] = yaxis_settings_state.get(1, {}).get('label', '')
+            secondary_ids = sorted(yaxis_id for yaxis_id in yaxis_settings_state if yaxis_id != 1)
+            labels_state['ylabel_secondary'] = yaxis_settings_state.get(secondary_ids[0], {}).get('label', '') if secondary_ids else ''
+
+            if regenerate_labels_check.isChecked():
+                for row_idx, series_idx in enumerate(series_indices):
+                    props_state[row_idx]['label'] = self.series_list[series_idx][0].strip('_')
+                refresh_curves_list()
+
+            self.subplot_axes_labels[subplot_idx] = dict(labels_state)
+            self.subplot_yaxis_settings[subplot_idx] = {int(yaxis_id): dict(settings) for yaxis_id, settings in yaxis_settings_state.items()}
+            self.subplot_series_props[subplot_idx] = [dict(props) for props in props_state]
+            self.subplot_config[subplot_idx] = {
+                'legend_show': legend_show_check.isChecked(),
+                'legend_pos': legend_pos_combo.currentText(),
+                'legend_orient': legend_orient_combo.currentText(),
+                'legend_fontsize': int(legend_fontsize_spin.value()),
+                'plot_mode': cfg_state.get('plot_mode', 'step'),
+                'grid_show': cfg_state.get('grid_show', True),
+                'marker': cfg_state.get('marker', ''),
+            }
+
+            x_min = self._parse_float(x_min_edit.text(), float(xlim[0]))
+            x_max = self._parse_float(x_max_edit.text(), float(xlim[1]))
+
+            self._skip_runtime_style_capture = True
+            try:
+                self.update_plot()
+            finally:
+                self._skip_runtime_style_capture = False
+
+            if subplot_idx < len(self.current_axes):
+                updated_ax = self.current_axes[subplot_idx]
+                try:
+                    updated_ax.set_xscale(x_scale_combo.currentText())
+                except Exception as exc:
+                    QtWidgets.QMessageBox.warning(dlg, 'Scale error', f'Failed to apply axis scale:\n{exc}')
+                try:
+                    updated_ax.set_xlim(min(x_min, x_max), max(x_min, x_max))
+                except Exception as exc:
+                    QtWidgets.QMessageBox.warning(dlg, 'Limits error', f'Failed to apply axis limits:\n{exc}')
+                self.canvas.draw_idle()
+
+        def on_ok():
+            apply_subplot_changes()
+            dlg.accept()
+
+        buttons.accepted.connect(on_ok)
+        buttons.rejected.connect(dlg.reject)
+        buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Apply).clicked.connect(apply_subplot_changes)
+        dlg.exec()
 
     def _on_mouse_move(self, event):
         """Update status bar with mouse coordinates when hovering over a subplot."""
@@ -499,7 +931,6 @@ class MainWindow(QtWidgets.QMainWindow):
         # Build a map from old series index -> series name
         old_names = {i: name for i, (name, *_rest) in enumerate(self.series_list)}
 
-        self._x = new_x
         self._x_col_name = col_name
 
         # Rebuild series_list from all_columns, excluding the new x column
@@ -523,6 +954,7 @@ class MainWindow(QtWidgets.QMainWindow):
         new_subplot_series = []
         new_subplot_props = []
         new_subplot_labels = []
+        new_subplot_yaxis_settings = []
         new_subplot_config = []
         for sub_idx, old_indices in enumerate(self.subplot_series):
             remapped_indices = []
@@ -541,6 +973,10 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.subplot_axes_labels[sub_idx] if sub_idx < len(self.subplot_axes_labels)
                     else {'xlabel': '', 'ylabel_primary': '', 'ylabel_secondary': ''}
                 )
+                new_subplot_yaxis_settings.append(
+                    dict(self._get_subplot_yaxis_settings(sub_idx)) if sub_idx < len(self.subplot_yaxis_settings)
+                    else {1: self._make_default_yaxis_settings(1)}
+                )
                 new_subplot_config.append(
                     self.subplot_config[sub_idx] if sub_idx < len(self.subplot_config)
                     else self._make_default_subplot_config()
@@ -549,6 +985,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.subplot_series = new_subplot_series
         self.subplot_series_props = new_subplot_props
         self.subplot_axes_labels = new_subplot_labels
+        self.subplot_yaxis_settings = new_subplot_yaxis_settings
         self.subplot_config = new_subplot_config
 
         # Reset x labels on all subplots so the new x column name is used
@@ -559,46 +996,155 @@ class MainWindow(QtWidgets.QMainWindow):
         self.update_plot()
         self._skip_xlabel_capture = False
 
-    def _fit_y_autoscale(self, *args):
-        """Fit Y data to axis while preserving the current X range."""
-        for ax in getattr(self, 'current_axes', []):
-            xlim = ax.get_xlim()
-            visible_y = []
-            # Consider only points inside the currently visible X window.
-            for line in ax.get_lines():
-                x_data = np.asarray(line.get_xdata())
-                y_data = np.asarray(line.get_ydata())
-                if x_data.size == 0 or y_data.size == 0:
-                    continue
-                mask = (x_data >= xlim[0]) & (x_data <= xlim[1])
-                if not np.any(mask):
-                    continue
-                y_visible = y_data[mask]
-                if y_visible.size == 0:
-                    continue
-                y_visible = y_visible[np.isfinite(y_visible)]
-                if y_visible.size:
-                    visible_y.append(y_visible)
+    def _fit_axis_visible_y(self, axis_obj, xlim):
+        """Fit one y-axis using only points visible in the given x window."""
+        visible_y = []
+        for line in axis_obj.get_lines():
+            x_data = np.asarray(line.get_xdata())
+            y_data = np.asarray(line.get_ydata())
+            if x_data.size == 0 or y_data.size == 0:
+                continue
+            mask = (x_data >= xlim[0]) & (x_data <= xlim[1])
+            if not np.any(mask):
+                continue
+            y_visible = y_data[mask]
+            if y_visible.size == 0:
+                continue
+            y_visible = y_visible[np.isfinite(y_visible)]
+            if y_visible.size:
+                visible_y.append(y_visible)
 
-            if visible_y:
-                all_visible_y = np.concatenate(visible_y)
-                y_min = float(np.min(all_visible_y))
-                y_max = float(np.max(all_visible_y))
-                if np.isclose(y_min, y_max):
-                    pad = 1.0 if y_min == 0.0 else abs(y_min) * 0.05
-                    y_min -= pad
-                    y_max += pad
-                else:
-                    pad = (y_max - y_min) * 0.05
-                    y_min -= pad
-                    y_max += pad
-                ax.set_ylim(y_min, y_max)
+        if visible_y:
+            all_visible_y = np.concatenate(visible_y)
+            y_min = float(np.min(all_visible_y))
+            y_max = float(np.max(all_visible_y))
+            if np.isclose(y_min, y_max):
+                pad = 1.0 if y_min == 0.0 else abs(y_min) * 0.05
+                y_min -= pad
+                y_max += pad
             else:
-                # Fallback when no visible points are present.
-                ax.relim()
-                ax.autoscale(enable=True, axis='y', tight=False)
+                pad = (y_max - y_min) * 0.05
+                y_min -= pad
+                y_max += pad
+            axis_obj.set_ylim(y_min, y_max)
+        else:
+            axis_obj.relim()
+            axis_obj.autoscale(enable=True, axis='y', tight=False)
+
+    def _fit_y_autoscale(self, *args):
+        """Fit all y-axes on each subplot while preserving the current X range."""
+        for subplot_idx, ax in enumerate(getattr(self, 'current_axes', [])):
+            xlim = ax.get_xlim()
+            axis_map = self._subplot_axes_map[subplot_idx] if subplot_idx < len(self._subplot_axes_map) else {1: ax}
+            if not axis_map:
+                axis_map = {1: ax}
+            for axis_obj in axis_map.values():
+                self._fit_axis_visible_y(axis_obj, xlim)
             ax.set_xlim(xlim)
         self.canvas.draw_idle()
+
+    def _is_pan_mode_active(self):
+        toolbar_mode = getattr(self.nav_toolbar, 'mode', '')
+        actions = getattr(self.nav_toolbar, '_actions', {})
+        pan_action = actions.get('pan') if isinstance(actions, dict) else None
+        pan_checked = bool(pan_action.isChecked()) if pan_action is not None else False
+        return bool(toolbar_mode) or pan_checked
+
+    def _axis_tick_hit_test(self, event):
+        """Return (subplot_index, axis_obj) if mouse is near a y-axis tick region."""
+        if event.x is None or event.y is None:
+            return None
+
+        # Pixel tolerance around the axis spine where y ticks/labels are expected.
+        tolerance_px = 24
+        right_candidates = []
+        for subplot_idx, axis_map in enumerate(self._subplot_axes_map):
+            primary_ax = self.current_axes[subplot_idx] if subplot_idx < len(self.current_axes) else None
+            if primary_ax is None:
+                continue
+
+            # Left side (primary axis)
+            left_spine = primary_ax.spines.get('left')
+            if left_spine is not None:
+                left_pos = left_spine.get_position()
+                left_x = primary_ax.bbox.x0
+                if isinstance(left_pos, tuple) and left_pos[0] == 'outward':
+                    left_x -= float(left_pos[1]) * self.fig.dpi / 72.0
+                if primary_ax.bbox.y0 <= event.y <= primary_ax.bbox.y1 and abs(event.x - left_x) <= tolerance_px:
+                    return (subplot_idx, primary_ax)
+
+            # Right side axes (including secondary)
+            for y_id, axis_obj in axis_map.items():
+                right_spine = axis_obj.spines.get('right')
+                if right_spine is None:
+                    continue
+                right_pos = right_spine.get_position()
+                right_x = axis_obj.bbox.x1
+                if isinstance(right_pos, tuple):
+                    if right_pos[0] == 'axes':
+                        right_x = axis_obj.transAxes.transform((float(right_pos[1]), 0.0))[0]
+                    elif right_pos[0] == 'outward':
+                        right_x = axis_obj.bbox.x1 + float(right_pos[1]) * self.fig.dpi / 72.0
+                if axis_obj.bbox.y0 <= event.y <= axis_obj.bbox.y1:
+                    distance = abs(event.x - right_x)
+                    if distance <= tolerance_px:
+                        # Prefer non-primary y-axes on tie (common when first twinx shares right spine x).
+                        preference = 0 if y_id != 1 else 1
+                        right_candidates.append((distance, preference, subplot_idx, axis_obj))
+
+        if right_candidates:
+            right_candidates.sort(key=lambda item: (item[0], item[1]))
+            _, _, subplot_idx, axis_obj = right_candidates[0]
+            return (subplot_idx, axis_obj)
+
+        return None
+
+    def _axis_pan_press(self, event):
+        if getattr(event, 'button', None) != 1:
+            return
+        if not self._is_pan_mode_active() or self._measure_active:
+            return
+
+        # Only take over when dragging from y-axis tick regions.
+        hit = self._axis_tick_hit_test(event)
+        if hit is None:
+            return
+
+        subplot_idx, target_axis = hit
+        primary_axis = self.current_axes[subplot_idx]
+        self._axis_pan_state = {
+            'subplot_idx': subplot_idx,
+            'target_axis': target_axis,
+            'primary_axis': primary_axis,
+            'start_y_px': float(event.y),
+            'start_ylim': tuple(target_axis.get_ylim()),
+            'start_xlim': tuple(primary_axis.get_xlim()),
+        }
+
+    def _axis_pan_move(self, event):
+        if self._axis_pan_state is None:
+            return
+        if event.y is None:
+            return
+
+        target_axis = self._axis_pan_state['target_axis']
+        primary_axis = self._axis_pan_state['primary_axis']
+        start_y_px = self._axis_pan_state['start_y_px']
+        start_ymin, start_ymax = self._axis_pan_state['start_ylim']
+        start_xlim = self._axis_pan_state['start_xlim']
+
+        bbox_h = max(float(target_axis.bbox.height), 1.0)
+        data_per_px = (start_ymax - start_ymin) / bbox_h
+        dy_px = float(event.y) - start_y_px
+        dy_data = -dy_px * data_per_px
+
+        target_axis.set_ylim(start_ymin + dy_data, start_ymax + dy_data)
+        primary_axis.set_xlim(start_xlim)
+        self.canvas.draw_idle()
+
+    def _axis_pan_release(self, event):
+        if self._axis_pan_state is not None:
+            self._axis_pan_state = None
 
     def _apply_theme(self, theme):
         """Switch between 'dark' and 'light' themes."""
@@ -650,7 +1196,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         legend_pos_combo = QtWidgets.QComboBox()
         legend_pos_combo.addItems(LEGEND_POSITIONS)
-        legend_pos_combo.setCurrentText(self.default_plot_style.get('legend_pos', 'best'))
+        legend_pos_combo.setCurrentText(self.default_plot_style.get('legend_pos', 'upper right'))
 
         legend_orient_combo = QtWidgets.QComboBox()
         legend_orient_combo.addItems(['vertical', 'horizontal'])
@@ -816,6 +1362,7 @@ class MainWindow(QtWidgets.QMainWindow):
         """Capture runtime labels and line style properties into persistent state lists."""
         axes = getattr(self, 'current_axes', [])
         for i, ax in enumerate(axes):
+            self._capture_subplot_yaxis_runtime_state(i)
             if i < len(self.subplot_axes_labels):
                 xlabel = ax.get_xlabel()
                 ylabel = ax.get_ylabel()
@@ -874,7 +1421,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 cfg = self.subplot_config[i] if i < len(self.subplot_config) else self._make_default_subplot_config()
                 cfg_el = ET.SubElement(subplot_el, 'config')
                 cfg_el.set('legend_show', self._to_bool_str(cfg.get('legend_show', True)))
-                cfg_el.set('legend_pos', str(cfg.get('legend_pos', 'best')))
+                cfg_el.set('legend_pos', str(cfg.get('legend_pos', 'upper right')))
                 cfg_el.set('legend_orient', str(cfg.get('legend_orient', 'vertical')))
                 cfg_el.set('legend_fontsize', str(cfg.get('legend_fontsize', 12)))
                 cfg_el.set('plot_mode', str(cfg.get('plot_mode', 'step')))
@@ -886,6 +1433,21 @@ class MainWindow(QtWidgets.QMainWindow):
                 labels_el.set('xlabel', str(labels.get('xlabel', '')))
                 labels_el.set('ylabel_primary', str(labels.get('ylabel_primary', '')))
                 labels_el.set('ylabel_secondary', str(labels.get('ylabel_secondary', '')))
+
+                y_axes_el = ET.SubElement(subplot_el, 'y_axes')
+                axis_settings_map = self._get_subplot_yaxis_settings(i)
+                for yaxis_id in sorted(axis_settings_map.keys()):
+                    axis_settings = axis_settings_map[yaxis_id]
+                    y_axis_el = ET.SubElement(y_axes_el, 'y_axis')
+                    y_axis_el.set('id', str(yaxis_id))
+                    y_axis_el.set('label', str(axis_settings.get('label', '')))
+                    y_axis_el.set('scale', str(axis_settings.get('scale', 'linear')))
+                    y_min = axis_settings.get('y_min')
+                    y_max = axis_settings.get('y_max')
+                    if y_min is not None:
+                        y_axis_el.set('y_min', repr(float(y_min)))
+                    if y_max is not None:
+                        y_axis_el.set('y_max', repr(float(y_max)))
 
                 if i < len(axes):
                     xlim = axes[i].get_xlim()
@@ -935,7 +1497,7 @@ class MainWindow(QtWidgets.QMainWindow):
             defaults_el = root.find('default_plot_style')
             if defaults_el is not None:
                 self.default_plot_style['legend_show'] = self._parse_bool(defaults_el.get('legend_show'), self.default_plot_style.get('legend_show', True))
-                self.default_plot_style['legend_pos'] = defaults_el.get('legend_pos', self.default_plot_style.get('legend_pos', 'best'))
+                self.default_plot_style['legend_pos'] = defaults_el.get('legend_pos', self.default_plot_style.get('legend_pos', 'upper right'))
                 self.default_plot_style['legend_orient'] = defaults_el.get('legend_orient', self.default_plot_style.get('legend_orient', 'vertical'))
                 self.default_plot_style['legend_fontsize'] = int(self._parse_float(defaults_el.get('legend_fontsize'), self.default_plot_style.get('legend_fontsize', 12)))
                 self.default_plot_style['plot_mode'] = defaults_el.get('plot_mode', self.default_plot_style.get('plot_mode', 'step'))
@@ -951,6 +1513,7 @@ class MainWindow(QtWidgets.QMainWindow):
             new_subplot_series = []
             new_subplot_props = []
             new_subplot_axes_labels = []
+            new_subplot_yaxis_settings = []
             new_subplot_config = []
             pending_limits = []
 
@@ -961,7 +1524,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     cfg_el = subplot_el.find('config')
                     if cfg_el is not None:
                         cfg['legend_show'] = self._parse_bool(cfg_el.get('legend_show'), cfg.get('legend_show', True))
-                        cfg['legend_pos'] = cfg_el.get('legend_pos', cfg.get('legend_pos', 'best'))
+                        cfg['legend_pos'] = cfg_el.get('legend_pos', cfg.get('legend_pos', 'upper right'))
                         cfg['legend_orient'] = cfg_el.get('legend_orient', cfg.get('legend_orient', 'vertical'))
                         cfg['legend_fontsize'] = int(self._parse_float(cfg_el.get('legend_fontsize'), cfg.get('legend_fontsize', 12)))
                         cfg['plot_mode'] = cfg_el.get('plot_mode', cfg.get('plot_mode', 'step'))
@@ -974,6 +1537,23 @@ class MainWindow(QtWidgets.QMainWindow):
                         labels['xlabel'] = labels_el.get('xlabel', '')
                         labels['ylabel_primary'] = labels_el.get('ylabel_primary', '')
                         labels['ylabel_secondary'] = labels_el.get('ylabel_secondary', '')
+
+                    yaxis_settings = {1: self._make_default_yaxis_settings(1)}
+                    y_axes_el = subplot_el.find('y_axes')
+                    if y_axes_el is not None:
+                        for y_axis_el in y_axes_el.findall('y_axis'):
+                            yaxis_id = int(self._parse_float(y_axis_el.get('id'), 1))
+                            axis_settings = self._make_default_yaxis_settings(yaxis_id)
+                            axis_settings['label'] = y_axis_el.get('label', '')
+                            axis_settings['scale'] = y_axis_el.get('scale', 'linear')
+                            axis_settings['y_min'] = self._parse_float(y_axis_el.get('y_min'), None)
+                            axis_settings['y_max'] = self._parse_float(y_axis_el.get('y_max'), None)
+                            yaxis_settings[yaxis_id] = axis_settings
+                    else:
+                        yaxis_settings[1]['label'] = labels.get('ylabel_primary', '')
+                        if labels.get('ylabel_secondary'):
+                            yaxis_settings[2] = self._make_default_yaxis_settings(2)
+                            yaxis_settings[2]['label'] = labels.get('ylabel_secondary', '')
 
                     xlim = None
                     ylim = None
@@ -1008,15 +1588,24 @@ class MainWindow(QtWidgets.QMainWindow):
                             })
 
                     if indices:
+                        for props_item in props:
+                            yaxis_id = int(props_item.get('yaxis', 1))
+                            if yaxis_id not in yaxis_settings:
+                                yaxis_settings[yaxis_id] = self._make_default_yaxis_settings(yaxis_id)
+                        if ylim is not None:
+                            yaxis_settings[1]['y_min'] = ylim[0]
+                            yaxis_settings[1]['y_max'] = ylim[1]
                         new_subplot_series.append(indices)
                         new_subplot_props.append(props)
                         new_subplot_axes_labels.append(labels)
+                        new_subplot_yaxis_settings.append(yaxis_settings)
                         new_subplot_config.append(cfg)
                         pending_limits.append((xlim, ylim))
 
             self.subplot_series = new_subplot_series
             self.subplot_series_props = new_subplot_props
             self.subplot_axes_labels = new_subplot_axes_labels
+            self.subplot_yaxis_settings = new_subplot_yaxis_settings
             self.subplot_config = new_subplot_config
 
             self.update_plot()
@@ -1125,7 +1714,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Use the first file's x as the default for measure cursor placement
         if len(self.series_list) == 0:
-            self._x = x_array
             self._x_col_name = x_col
 
         # Append series with file prefix and track file
@@ -1193,7 +1781,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Use the first file's x as the default for measure cursor placement
         if len(self.series_list) == 0:
-            self._x = x_array
             self._x_col_name = x_col
 
         # Append series with file prefix and track file
@@ -1259,7 +1846,6 @@ class MainWindow(QtWidgets.QMainWindow):
         x_col, all_columns = result_data['data']
         x_array = all_columns[x_col]
 
-        self._x = x_array
         self._all_columns = all_columns
         self._x_col_name = x_col
         self._merged_mode = False
@@ -1270,6 +1856,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.subplot_series.clear()
         self.subplot_series_props.clear()
         self.subplot_axes_labels.clear()
+        self.subplot_yaxis_settings.clear()
         self.subplot_config.clear()
         self._loaded_files.clear()
 
@@ -1343,7 +1930,6 @@ class MainWindow(QtWidgets.QMainWindow):
         x_col, all_columns = result_data['data']
         x_array = all_columns[x_col]
 
-        self._x = x_array
         self._all_columns = all_columns
         self._x_col_name = x_col
         self._merged_mode = False
@@ -1354,6 +1940,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.subplot_series.clear()
         self.subplot_series_props.clear()
         self.subplot_axes_labels.clear()
+        self.subplot_yaxis_settings.clear()
         self.subplot_config.clear()
         self._loaded_files.clear()
 
@@ -1427,7 +2014,6 @@ class MainWindow(QtWidgets.QMainWindow):
         x_col, all_columns = result_data['data']
         x_array = all_columns[x_col]
 
-        self._x = x_array
         self._all_columns = all_columns
         self._x_col_name = x_col
         self._merged_mode = False
@@ -1438,6 +2024,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.subplot_series.clear()
         self.subplot_series_props.clear()
         self.subplot_axes_labels.clear()
+        self.subplot_yaxis_settings.clear()
         self.subplot_config.clear()
         self._loaded_files.clear()
 
@@ -1512,7 +2099,6 @@ class MainWindow(QtWidgets.QMainWindow):
         x_array = all_columns[x_col]
 
         if len(self.series_list) == 0:
-            self._x = x_array
             self._x_col_name = x_col
 
         file_entry = {'name': prefix, 'series_indices': []}
@@ -1577,7 +2163,6 @@ class MainWindow(QtWidgets.QMainWindow):
         x_col, all_columns = result_data['data']
         x_array = all_columns[x_col]
 
-        self._x = x_array
         self._all_columns = all_columns
         self._x_col_name = x_col
         self._merged_mode = False
@@ -1588,6 +2173,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.subplot_series.clear()
         self.subplot_series_props.clear()
         self.subplot_axes_labels.clear()
+        self.subplot_yaxis_settings.clear()
         self.subplot_config.clear()
         self._loaded_files.clear()
 
@@ -1662,7 +2248,6 @@ class MainWindow(QtWidgets.QMainWindow):
         x_array = all_columns[x_col]
 
         if len(self.series_list) == 0:
-            self._x = x_array
             self._x_col_name = x_col
 
         file_entry = {'name': prefix, 'series_indices': []}
@@ -1822,6 +2407,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.subplot_series_props.append([dict(p) for p in props])
                 # store axes labels
                 self.subplot_axes_labels.append(dict(axes_labels) if axes_labels is not None else {'xlabel': '', 'ylabel_primary': '', 'ylabel_secondary': ''})
+                self.subplot_yaxis_settings.append({1: self._make_default_yaxis_settings(1)})
                 self.subplot_config.append(self._make_default_subplot_config())
                 self.update_plot()
 
@@ -1842,6 +2428,10 @@ class MainWindow(QtWidgets.QMainWindow):
             initial_props = []
         if initial_axes is None:
             initial_axes = {}
+
+        ROLE_SERIES_INDEX = QtCore.Qt.ItemDataRole.UserRole
+        ROLE_YAXIS = QtCore.Qt.ItemDataRole.UserRole + 1
+        ROLE_BASE_NAME = QtCore.Qt.ItemDataRole.UserRole + 2
 
         dlg = QtWidgets.QDialog(self)
         dlg.setWindowTitle('Edit series for subplot')
@@ -1867,6 +2457,26 @@ class MainWindow(QtWidgets.QMainWindow):
                 series_to_file[sidx] = file_idx
 
         plotted_set = set(initial_plotted)
+
+        initial_yaxis_by_series = {}
+        for j, sidx in enumerate(initial_plotted):
+            yaxis_val = 1
+            if j < len(initial_props):
+                yaxis_val = int(initial_props[j].get('yaxis', 1))
+            if yaxis_val < 1:
+                yaxis_val = 1
+            initial_yaxis_by_series[sidx] = yaxis_val
+
+        def _refresh_plotted_item_text(item):
+            base_name = item.data(ROLE_BASE_NAME)
+            if base_name is None:
+                base_name = item.text()
+                item.setData(ROLE_BASE_NAME, base_name)
+            yaxis_val = item.data(ROLE_YAXIS)
+            if yaxis_val is None:
+                yaxis_val = 1
+                item.setData(ROLE_YAXIS, yaxis_val)
+            item.setText(f'{base_name}  [Y{int(yaxis_val)}]')
 
         # Build file tabs (or single list if only one file)
         use_tabs = len(self._loaded_files) > 1
@@ -1896,7 +2506,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 for sidx in fentry['series_indices']:
                     name = self.series_list[sidx][0]
                     item = QtWidgets.QListWidgetItem(name)
-                    item.setData(QtCore.Qt.ItemDataRole.UserRole, sidx)
+                    item.setData(ROLE_SERIES_INDEX, sidx)
+                    item.setData(ROLE_BASE_NAME, name)
                     if sidx not in plotted_set:
                         lst.addItem(item)
 
@@ -1931,7 +2542,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
             for idx, (name, *_rest) in enumerate(self.series_list):
                 item = QtWidgets.QListWidgetItem(name)
-                item.setData(QtCore.Qt.ItemDataRole.UserRole, idx)
+                item.setData(ROLE_SERIES_INDEX, idx)
+                item.setData(ROLE_BASE_NAME, name)
                 if idx not in plotted_set:
                     avail_list.addItem(item)
 
@@ -1999,7 +2611,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
             # Build a mapping of series name -> (data_array, x_array)
             series_map = {}
-            for idx_s, (sname, sfunc, sx) in enumerate(self.series_list):
+            for sname, sfunc, sx in self.series_list:
                 y_data = sfunc(sx, float(self.default_freq))
                 series_map[sname] = (y_data, sx)
 
@@ -2107,7 +2719,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
             # Add directly to plotted list
             item = QtWidgets.QListWidgetItem(expr_label)
-            item.setData(QtCore.Qt.ItemDataRole.UserRole, new_idx)
+            item.setData(ROLE_SERIES_INDEX, new_idx)
+            item.setData(ROLE_BASE_NAME, expr_label)
+            item.setData(ROLE_YAXIS, 1)
+            _refresh_plotted_item_text(item)
             plotted_list.addItem(item)
 
             expr_field.clear()
@@ -2137,12 +2752,70 @@ class MainWindow(QtWidgets.QMainWindow):
         plotted_list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
         plotted_layout.addWidget(plotted_list)
 
+        set_yaxis_btn = QtWidgets.QPushButton('Set Y axis...')
+        set_yaxis_btn.setToolTip('Assign selected plotted series to Y1 (primary), an existing axis, or a new axis')
+        plotted_layout.addWidget(set_yaxis_btn)
+
         # Populate plotted list with initial_plotted items
         for sidx in initial_plotted:
             name = self.series_list[sidx][0]
             item = QtWidgets.QListWidgetItem(name)
-            item.setData(QtCore.Qt.ItemDataRole.UserRole, sidx)
+            item.setData(ROLE_SERIES_INDEX, sidx)
+            item.setData(ROLE_BASE_NAME, name)
+            item.setData(ROLE_YAXIS, initial_yaxis_by_series.get(sidx, 1))
+            _refresh_plotted_item_text(item)
             plotted_list.addItem(item)
+
+        def set_selected_yaxis():
+            item = plotted_list.currentItem()
+            if item is None:
+                QtWidgets.QMessageBox.information(dlg, 'Y axis', 'Select one plotted series first.')
+                return
+
+            existing = set()
+            for i in range(plotted_list.count()):
+                it = plotted_list.item(i)
+                yv = it.data(ROLE_YAXIS)
+                existing.add(int(yv) if yv is not None else 1)
+            if not existing:
+                existing = {1}
+
+            options = []
+            for yv in sorted(existing):
+                if yv == 1:
+                    options.append('Y1 (Primary)')
+                else:
+                    options.append(f'Y{yv} (Existing)')
+            options.append('Create new Y axis')
+
+            selected_text, ok = QtWidgets.QInputDialog.getItem(
+                dlg,
+                'Set Y axis',
+                'Assign selected series to:',
+                options,
+                0,
+                False,
+            )
+            if not ok or not selected_text:
+                return
+
+            if selected_text == 'Create new Y axis':
+                new_y = max(existing) + 1
+            elif selected_text.startswith('Y'):
+                number_txt = selected_text.split(' ', 1)[0][1:]
+                try:
+                    new_y = int(number_txt)
+                except ValueError:
+                    new_y = 1
+            else:
+                new_y = 1
+
+            if new_y < 1:
+                new_y = 1
+            item.setData(ROLE_YAXIS, new_y)
+            _refresh_plotted_item_text(item)
+
+        set_yaxis_btn.clicked.connect(set_selected_yaxis)
 
         # --- Move helpers ---
         def get_active_avail_list():
@@ -2159,6 +2832,8 @@ class MainWindow(QtWidgets.QMainWindow):
             for it in items:
                 row = src.row(it)
                 src.takeItem(row)
+                it.setData(ROLE_YAXIS, 1)
+                _refresh_plotted_item_text(it)
                 plotted_list.addItem(it)
 
         def _avail_list_has_index(lst, sidx):
@@ -2175,7 +2850,11 @@ class MainWindow(QtWidgets.QMainWindow):
             for it in items:
                 row = plotted_list.row(it)
                 plotted_list.takeItem(row)
-                sidx = int(it.data(QtCore.Qt.ItemDataRole.UserRole))
+                sidx = int(it.data(ROLE_SERIES_INDEX))
+                base_name = it.data(ROLE_BASE_NAME)
+                if base_name is not None:
+                    it.setText(str(base_name))
+                it.setData(ROLE_YAXIS, None)
                 file_idx = series_to_file.get(sidx, 0)
                 target = avail_lists[file_idx] if file_idx < len(avail_lists) else (avail_lists[0] if avail_lists else None)
                 if target is not None and not _avail_list_has_index(target, sidx):
@@ -2194,13 +2873,22 @@ class MainWindow(QtWidgets.QMainWindow):
             """Move all items from plotted list back to their original file tabs."""
             while plotted_list.count() > 0:
                 it = plotted_list.takeItem(0)
-                sidx = int(it.data(QtCore.Qt.ItemDataRole.UserRole))
+                sidx = int(it.data(ROLE_SERIES_INDEX))
+                base_name = it.data(ROLE_BASE_NAME)
+                if base_name is not None:
+                    it.setText(str(base_name))
+                it.setData(ROLE_YAXIS, None)
                 file_idx = series_to_file.get(sidx, 0)
                 target = avail_lists[file_idx] if file_idx < len(avail_lists) else (avail_lists[0] if avail_lists else None)
                 if target is not None and not _avail_list_has_index(target, sidx):
                     target.addItem(it)
 
-        add_btn.clicked.connect(lambda: move_selected_from(get_active_avail_list()) if get_active_avail_list() else None)
+        def on_add_clicked():
+            src = get_active_avail_list()
+            if src is not None:
+                move_selected_from(src)
+
+        add_btn.clicked.connect(on_add_clicked)
         remove_btn.clicked.connect(move_selected_to_avail)
         add_all_btn.clicked.connect(move_all_to_plotted)
         remove_all_btn.clicked.connect(move_all_to_avail)
@@ -2222,22 +2910,28 @@ class MainWindow(QtWidgets.QMainWindow):
         def on_ok():
             # collect plotted indices in order
             plotted_indices = []
+            plotted_yaxes = []
             for i in range(plotted_list.count()):
                 it = plotted_list.item(i)
-                idx = it.data(QtCore.Qt.ItemDataRole.UserRole)
+                idx = it.data(ROLE_SERIES_INDEX)
                 plotted_indices.append(int(idx))
+                yaxis_val = it.data(ROLE_YAXIS)
+                plotted_yaxes.append(int(yaxis_val) if yaxis_val is not None else 1)
             # Preserve existing props where available, create defaults for new series
             existing_props_map = {}
             for j, sidx in enumerate(initial_plotted):
                 if j < len(initial_props):
                     existing_props_map[sidx] = initial_props[j]
             props = []
-            for sidx in plotted_indices:
+            for k, sidx in enumerate(plotted_indices):
+                yaxis_value = plotted_yaxes[k] if k < len(plotted_yaxes) else 1
                 if sidx in existing_props_map:
-                    props.append(dict(existing_props_map[sidx]))
+                    p = dict(existing_props_map[sidx])
+                    p['yaxis'] = yaxis_value
+                    props.append(p)
                 else:
                     name = self.series_list[sidx][0]
-                    props.append({'label': name, 'color': '', 'linewidth': 1.5, 'linestyle': '', 'marker': '', 'yaxis': 1})
+                    props.append({'label': name, 'color': '', 'linewidth': 1.5, 'linestyle': '', 'marker': '', 'yaxis': yaxis_value})
             axes_labels = dict(initial_axes) if initial_axes else {'xlabel': '', 'ylabel_primary': '', 'ylabel_secondary': ''}
             on_accept(plotted_indices, props, axes_labels)
             dlg.accept()
@@ -2257,9 +2951,16 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         # Find which axes was clicked
+        ax_index = None
         try:
             ax_index = self.current_axes.index(event.inaxes)
         except Exception:
+            # Secondary (twinx) axes are not in current_axes, so resolve via runtime axis map.
+            for sub_idx, axis_map in enumerate(self._subplot_axes_map):
+                if event.inaxes in axis_map.values():
+                    ax_index = sub_idx
+                    break
+        if ax_index is None:
             return
 
         # Double-click: edit the subplot's series
@@ -2283,6 +2984,8 @@ class MainWindow(QtWidgets.QMainWindow):
                         while len(self.subplot_axes_labels) < ax_index:
                             self.subplot_axes_labels.append({'xlabel': '', 'ylabel_primary': '', 'ylabel_secondary': ''})
                         self.subplot_axes_labels.insert(ax_index, dict(axes_labels) if axes_labels is not None else {'xlabel': '', 'ylabel_primary': '', 'ylabel_secondary': ''})
+                    while len(self.subplot_yaxis_settings) <= ax_index:
+                        self.subplot_yaxis_settings.append({1: self._make_default_yaxis_settings(1)})
                     self.update_plot()
 
             # provide existing props if available
@@ -2342,7 +3045,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
             # Position submenu
             pos_menu = legend_menu.addMenu('Position')
-            current_pos = cur_cfg.get('legend_pos', 'best')
+            current_pos = cur_cfg.get('legend_pos', 'upper right')
             pos_group = QtGui.QActionGroup(pos_menu)
             for p in LEGEND_POSITIONS:
                 a = QtGui.QAction(p, self)
@@ -2412,6 +3115,37 @@ class MainWindow(QtWidgets.QMainWindow):
                     return handler
                 a.triggered.connect(make_mode_handler(mode))
 
+            # --- Y-axis control submenu ---
+            y_axes_menu = menu.addMenu('Y axis control')
+            axis_map = self._subplot_axes_map[ax_index] if ax_index < len(self._subplot_axes_map) else {1: self.current_axes[ax_index]}
+            for y_id in sorted(axis_map.keys()):
+                axis_obj = axis_map[y_id]
+                axis_title = f'Y{y_id}'
+                axis_submenu = y_axes_menu.addMenu(axis_title)
+
+                fit_visible_action = QtGui.QAction('Fit visible X window', self)
+                def make_fit_visible_handler(target_axis, primary_axis):
+                    def handler():
+                        xlim = primary_axis.get_xlim()
+                        self._fit_axis_visible_y(target_axis, xlim)
+                        primary_axis.set_xlim(xlim)
+                        self.canvas.draw_idle()
+                    return handler
+                fit_visible_action.triggered.connect(make_fit_visible_handler(axis_obj, self.current_axes[ax_index]))
+                axis_submenu.addAction(fit_visible_action)
+
+                fit_full_action = QtGui.QAction('Fit full series', self)
+                def make_fit_full_handler(target_axis, primary_axis):
+                    def handler():
+                        xlim = primary_axis.get_xlim()
+                        target_axis.relim()
+                        target_axis.autoscale(enable=True, axis='y', tight=False)
+                        primary_axis.set_xlim(xlim)
+                        self.canvas.draw_idle()
+                    return handler
+                fit_full_action.triggered.connect(make_fit_full_handler(axis_obj, self.current_axes[ax_index]))
+                axis_submenu.addAction(fit_full_action)
+
             menu.addSeparator()
             menu.addAction(delete_action)
 
@@ -2453,6 +3187,8 @@ class MainWindow(QtWidgets.QMainWindow):
                         self.subplot_series_props.pop(ax_index)
                     if ax_index < len(self.subplot_axes_labels):
                         self.subplot_axes_labels.pop(ax_index)
+                    if ax_index < len(self.subplot_yaxis_settings):
+                        self.subplot_yaxis_settings.pop(ax_index)
                     if ax_index < len(self.subplot_config):
                         self.subplot_config.pop(ax_index)
                     self.update_plot()
@@ -2468,6 +3204,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.subplot_series_props.insert(insert_pos, [dict(p) for p in props])
                     # insert axes labels
                     self.subplot_axes_labels.insert(insert_pos, dict(axes_labels) if axes_labels is not None else {'xlabel': '', 'ylabel_primary': '', 'ylabel_secondary': ''})
+                    self.subplot_yaxis_settings.insert(insert_pos, {1: self._make_default_yaxis_settings(1)})
                     self.subplot_config.insert(insert_pos, self._make_default_subplot_config())
                     self.update_plot()
 
