@@ -1,8 +1,8 @@
 # TouCAN-Plot
 
-An interactive PyQt6 + Matplotlib plotting tool for CSV, SMV, and CAN bus log files.
+An interactive PySide6 + Matplotlib plotting tool for CSV, SMV, and CAN bus log files.
 
-![Python](https://img.shields.io/badge/python-3.11+-blue)
+![Python](https://img.shields.io/badge/python-3.13+-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 ## Features
@@ -97,8 +97,8 @@ toucan-plot
 
 ## Requirements
 
-- Python ≥ 3.11
-- PyQt6
+- Python ≥ 3.13
+- PySide6
 - Matplotlib
 - NumPy
 - pyqtdarktheme

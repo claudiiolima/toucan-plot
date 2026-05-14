@@ -1,7 +1,9 @@
 import os
 import sys
 import multiprocessing
+import ast
 import numpy as np
+import xml.etree.ElementTree as ET
 from PySide6 import QtWidgets, QtCore, QtGui
 import matplotlib as mpl
 from matplotlib.figure import Figure
@@ -54,6 +56,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 file_menu.addAction(self._merge_action)
                 file_menu.addSeparator()
                 file_menu.addAction(exit_action)
+
+            options_menu = menubar.addMenu('Options')
+            save_plot_settings_action = QtGui.QAction('Save plot settings', self)
+            save_plot_settings_action.triggered.connect(self.save_plot_settings)
+            if options_menu is not None:
+                options_menu.addAction(save_plot_settings_action)
 
             style_menu = menubar.addMenu('Style')
             style_action = QtGui.QAction('Customize plot style', self)
@@ -216,6 +224,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._merged_mode = False  # True when multiple files are merged
         # Tracks loaded files: list of {'name': str, 'series_indices': [int, ...]}
         self._loaded_files = []
+        self._main_opened_file_path = ''
         # Each series is a callable that accepts x and freq and returns y
         self.series_list = []
         # Keep track of series per subplot: a list of lists. Each sublist contains indices into series_list.
@@ -554,8 +563,40 @@ class MainWindow(QtWidgets.QMainWindow):
         """Fit Y data to axis while preserving the current X range."""
         for ax in getattr(self, 'current_axes', []):
             xlim = ax.get_xlim()
-            ax.relim()
-            ax.autoscale(enable=True, axis='y', tight=False)
+            visible_y = []
+            # Consider only points inside the currently visible X window.
+            for line in ax.get_lines():
+                x_data = np.asarray(line.get_xdata())
+                y_data = np.asarray(line.get_ydata())
+                if x_data.size == 0 or y_data.size == 0:
+                    continue
+                mask = (x_data >= xlim[0]) & (x_data <= xlim[1])
+                if not np.any(mask):
+                    continue
+                y_visible = y_data[mask]
+                if y_visible.size == 0:
+                    continue
+                y_visible = y_visible[np.isfinite(y_visible)]
+                if y_visible.size:
+                    visible_y.append(y_visible)
+
+            if visible_y:
+                all_visible_y = np.concatenate(visible_y)
+                y_min = float(np.min(all_visible_y))
+                y_max = float(np.max(all_visible_y))
+                if np.isclose(y_min, y_max):
+                    pad = 1.0 if y_min == 0.0 else abs(y_min) * 0.05
+                    y_min -= pad
+                    y_max += pad
+                else:
+                    pad = (y_max - y_min) * 0.05
+                    y_min -= pad
+                    y_max += pad
+                ax.set_ylim(y_min, y_max)
+            else:
+                # Fallback when no visible points are present.
+                ax.relim()
+                ax.autoscale(enable=True, axis='y', tight=False)
             ax.set_xlim(xlim)
         self.canvas.draw_idle()
 
@@ -733,6 +774,265 @@ class MainWindow(QtWidgets.QMainWindow):
         file_filter = "All supported files (*.csv *.smv *.blf *.trc *.asc *.dbc *.mf4 *.mf4z *.feather);;CSV files (*.csv *.smv);;MF4 files (*.mf4 *.mf4z);;Feather files (*.feather);;CAN files (*.blf *.trc *.asc *.dbc);;All files (*)"
         paths, _ = QtWidgets.QFileDialog.getOpenFileNames(self, 'Open File', '', file_filter)
         self.open_files(paths)
+
+    def _to_bool_str(self, value):
+        return 'true' if bool(value) else 'false'
+
+    def _parse_bool(self, text, default=False):
+        if text is None:
+            return default
+        return str(text).strip().lower() in ('1', 'true', 'yes', 'on')
+
+    def _parse_float(self, text, default):
+        try:
+            return float(text)
+        except (TypeError, ValueError):
+            return default
+
+    def _parse_color_value(self, text):
+        if text is None:
+            return ''
+        raw = str(text).strip()
+        if not raw:
+            return ''
+        # Backward compatibility: old settings may store RGBA tuples as strings.
+        if raw.startswith(('(', '[')):
+            try:
+                parsed = ast.literal_eval(raw)
+                if isinstance(parsed, (tuple, list)):
+                    return tuple(parsed)
+            except (ValueError, SyntaxError):
+                return ''
+        return raw
+
+    def _get_settings_path_for_data_file(self, data_file_path):
+        if not data_file_path:
+            return ''
+        folder = os.path.dirname(data_file_path)
+        base_name = os.path.splitext(os.path.basename(data_file_path))[0]
+        return os.path.join(folder, f'{base_name}.xml')
+
+    def _capture_plot_runtime_state(self):
+        """Capture runtime labels and line style properties into persistent state lists."""
+        axes = getattr(self, 'current_axes', [])
+        for i, ax in enumerate(axes):
+            if i < len(self.subplot_axes_labels):
+                xlabel = ax.get_xlabel()
+                ylabel = ax.get_ylabel()
+                if xlabel and xlabel != self._x_col_name and not self._skip_xlabel_capture:
+                    self.subplot_axes_labels[i]['xlabel'] = xlabel
+                if ylabel:
+                    self.subplot_axes_labels[i]['ylabel_primary'] = ylabel
+
+            if (i < len(self._plotted_line_artists)
+                    and i < len(self._plotted_series_snapshot)
+                    and i < len(self.subplot_series)
+                    and self._plotted_series_snapshot[i] == self.subplot_series[i]
+                    and i < len(self.subplot_series_props)):
+                line_artists = self._plotted_line_artists[i]
+                for j, line in enumerate(line_artists):
+                    if j < len(self.subplot_series_props[i]):
+                        label = line.get_label()
+                        if label and not label.startswith('_'):
+                            self.subplot_series_props[i][j]['label'] = label
+                        color = line.get_color()
+                        if color:
+                            self.subplot_series_props[i][j]['color'] = color
+                        self.subplot_series_props[i][j]['linewidth'] = line.get_linewidth()
+                        self.subplot_series_props[i][j]['linestyle'] = line.get_linestyle()
+                        marker = line.get_marker()
+                        self.subplot_series_props[i][j]['marker'] = marker if marker and marker != 'None' else ''
+
+    def save_plot_settings(self):
+        if not self._main_opened_file_path:
+            QtWidgets.QMessageBox.information(self, 'Save plot settings', 'Open a data file first.')
+            return
+        if self._merged_mode:
+            QtWidgets.QMessageBox.warning(self, 'Save plot settings', 'Saving settings is only available for a single opened file (non-merged mode).')
+            return
+
+        self._capture_plot_runtime_state()
+        settings_path = self._get_settings_path_for_data_file(self._main_opened_file_path)
+        if not settings_path:
+            QtWidgets.QMessageBox.warning(self, 'Save plot settings', 'Failed to determine settings file path.')
+            return
+
+        try:
+            root = ET.Element('toucan_plot_settings', version='1')
+
+            defaults_el = ET.SubElement(root, 'default_plot_style')
+            for key in ('legend_show', 'legend_pos', 'legend_orient', 'legend_fontsize', 'plot_mode', 'grid_show', 'marker'):
+                defaults_el.set(key, str(self.default_plot_style.get(key, '')))
+
+            root.set('x_axis_column', str(self._x_col_name or ''))
+
+            subplots_el = ET.SubElement(root, 'subplots')
+            axes = getattr(self, 'current_axes', [])
+            for i, series_indices in enumerate(self.subplot_series):
+                subplot_el = ET.SubElement(subplots_el, 'subplot', index=str(i))
+
+                cfg = self.subplot_config[i] if i < len(self.subplot_config) else self._make_default_subplot_config()
+                cfg_el = ET.SubElement(subplot_el, 'config')
+                cfg_el.set('legend_show', self._to_bool_str(cfg.get('legend_show', True)))
+                cfg_el.set('legend_pos', str(cfg.get('legend_pos', 'best')))
+                cfg_el.set('legend_orient', str(cfg.get('legend_orient', 'vertical')))
+                cfg_el.set('legend_fontsize', str(cfg.get('legend_fontsize', 12)))
+                cfg_el.set('plot_mode', str(cfg.get('plot_mode', 'step')))
+                cfg_el.set('grid_show', self._to_bool_str(cfg.get('grid_show', True)))
+                cfg_el.set('marker', str(cfg.get('marker', '')))
+
+                labels = self.subplot_axes_labels[i] if i < len(self.subplot_axes_labels) else {}
+                labels_el = ET.SubElement(subplot_el, 'labels')
+                labels_el.set('xlabel', str(labels.get('xlabel', '')))
+                labels_el.set('ylabel_primary', str(labels.get('ylabel_primary', '')))
+                labels_el.set('ylabel_secondary', str(labels.get('ylabel_secondary', '')))
+
+                if i < len(axes):
+                    xlim = axes[i].get_xlim()
+                    ylim = axes[i].get_ylim()
+                    limits_el = ET.SubElement(subplot_el, 'limits')
+                    limits_el.set('x_min', repr(float(xlim[0])))
+                    limits_el.set('x_max', repr(float(xlim[1])))
+                    limits_el.set('y_min', repr(float(ylim[0])))
+                    limits_el.set('y_max', repr(float(ylim[1])))
+
+                series_el = ET.SubElement(subplot_el, 'series')
+                props_list = self.subplot_series_props[i] if i < len(self.subplot_series_props) else []
+                for j, sidx in enumerate(series_indices):
+                    if sidx < 0 or sidx >= len(self.series_list):
+                        continue
+                    name = self.series_list[sidx][0]
+                    p = props_list[j] if j < len(props_list) else {}
+                    item_el = ET.SubElement(series_el, 'item')
+                    item_el.set('name', str(name))
+                    item_el.set('label', str(p.get('label', name)))
+                    item_el.set('color', str(p.get('color', '')))
+                    item_el.set('linewidth', str(p.get('linewidth', 1.5)))
+                    item_el.set('linestyle', str(p.get('linestyle', '')))
+                    item_el.set('marker', str(p.get('marker', '')))
+                    item_el.set('yaxis', str(p.get('yaxis', 1)))
+
+            tree = ET.ElementTree(root)
+            ET.indent(tree, space='  ')
+            tree.write(settings_path, encoding='utf-8', xml_declaration=True)
+            QtWidgets.QMessageBox.information(self, 'Save plot settings', f'Settings saved to:\n{settings_path}')
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, 'Save plot settings', f'Failed to save settings:\n{exc}')
+
+    def _try_load_plot_settings(self, data_file_path):
+        if not data_file_path or self._merged_mode:
+            return False
+        settings_path = self._get_settings_path_for_data_file(data_file_path)
+        if not settings_path or not os.path.exists(settings_path):
+            return False
+
+        try:
+            tree = ET.parse(settings_path)
+            root = tree.getroot()
+            if root.tag != 'toucan_plot_settings':
+                return False
+
+            defaults_el = root.find('default_plot_style')
+            if defaults_el is not None:
+                self.default_plot_style['legend_show'] = self._parse_bool(defaults_el.get('legend_show'), self.default_plot_style.get('legend_show', True))
+                self.default_plot_style['legend_pos'] = defaults_el.get('legend_pos', self.default_plot_style.get('legend_pos', 'best'))
+                self.default_plot_style['legend_orient'] = defaults_el.get('legend_orient', self.default_plot_style.get('legend_orient', 'vertical'))
+                self.default_plot_style['legend_fontsize'] = int(self._parse_float(defaults_el.get('legend_fontsize'), self.default_plot_style.get('legend_fontsize', 12)))
+                self.default_plot_style['plot_mode'] = defaults_el.get('plot_mode', self.default_plot_style.get('plot_mode', 'step'))
+                self.default_plot_style['grid_show'] = self._parse_bool(defaults_el.get('grid_show'), self.default_plot_style.get('grid_show', True))
+                self.default_plot_style['marker'] = defaults_el.get('marker', self.default_plot_style.get('marker', ''))
+
+            x_axis_column = root.get('x_axis_column', '')
+            if x_axis_column and x_axis_column in self._all_columns and x_axis_column != self._x_col_name:
+                self._change_x_axis(x_axis_column)
+
+            name_to_index = {name: i for i, (name, *_rest) in enumerate(self.series_list)}
+
+            new_subplot_series = []
+            new_subplot_props = []
+            new_subplot_axes_labels = []
+            new_subplot_config = []
+            pending_limits = []
+
+            subplots_el = root.find('subplots')
+            if subplots_el is not None:
+                for subplot_el in subplots_el.findall('subplot'):
+                    cfg = self._make_default_subplot_config()
+                    cfg_el = subplot_el.find('config')
+                    if cfg_el is not None:
+                        cfg['legend_show'] = self._parse_bool(cfg_el.get('legend_show'), cfg.get('legend_show', True))
+                        cfg['legend_pos'] = cfg_el.get('legend_pos', cfg.get('legend_pos', 'best'))
+                        cfg['legend_orient'] = cfg_el.get('legend_orient', cfg.get('legend_orient', 'vertical'))
+                        cfg['legend_fontsize'] = int(self._parse_float(cfg_el.get('legend_fontsize'), cfg.get('legend_fontsize', 12)))
+                        cfg['plot_mode'] = cfg_el.get('plot_mode', cfg.get('plot_mode', 'step'))
+                        cfg['grid_show'] = self._parse_bool(cfg_el.get('grid_show'), cfg.get('grid_show', True))
+                        cfg['marker'] = cfg_el.get('marker', cfg.get('marker', ''))
+
+                    labels = {'xlabel': '', 'ylabel_primary': '', 'ylabel_secondary': ''}
+                    labels_el = subplot_el.find('labels')
+                    if labels_el is not None:
+                        labels['xlabel'] = labels_el.get('xlabel', '')
+                        labels['ylabel_primary'] = labels_el.get('ylabel_primary', '')
+                        labels['ylabel_secondary'] = labels_el.get('ylabel_secondary', '')
+
+                    xlim = None
+                    ylim = None
+                    limits_el = subplot_el.find('limits')
+                    if limits_el is not None:
+                        x_min = self._parse_float(limits_el.get('x_min'), None)
+                        x_max = self._parse_float(limits_el.get('x_max'), None)
+                        y_min = self._parse_float(limits_el.get('y_min'), None)
+                        y_max = self._parse_float(limits_el.get('y_max'), None)
+                        if x_min is not None and x_max is not None:
+                            xlim = (x_min, x_max)
+                        if y_min is not None and y_max is not None:
+                            ylim = (y_min, y_max)
+
+                    indices = []
+                    props = []
+                    series_el = subplot_el.find('series')
+                    if series_el is not None:
+                        for item_el in series_el.findall('item'):
+                            s_name = item_el.get('name', '')
+                            if s_name not in name_to_index:
+                                continue
+                            sidx = name_to_index[s_name]
+                            indices.append(sidx)
+                            props.append({
+                                'label': item_el.get('label', s_name),
+                                'color': self._parse_color_value(item_el.get('color', '')),
+                                'linewidth': self._parse_float(item_el.get('linewidth'), 1.5),
+                                'linestyle': item_el.get('linestyle', ''),
+                                'marker': item_el.get('marker', ''),
+                                'yaxis': int(self._parse_float(item_el.get('yaxis'), 1)),
+                            })
+
+                    if indices:
+                        new_subplot_series.append(indices)
+                        new_subplot_props.append(props)
+                        new_subplot_axes_labels.append(labels)
+                        new_subplot_config.append(cfg)
+                        pending_limits.append((xlim, ylim))
+
+            self.subplot_series = new_subplot_series
+            self.subplot_series_props = new_subplot_props
+            self.subplot_axes_labels = new_subplot_axes_labels
+            self.subplot_config = new_subplot_config
+
+            self.update_plot()
+            axes = getattr(self, 'current_axes', [])
+            for i, limits in enumerate(pending_limits):
+                if i >= len(axes):
+                    break
+                xlim, ylim = limits
+                if xlim is not None:
+                    axes[i].set_xlim(xlim)
+                if ylim is not None:
+                    axes[i].set_ylim(ylim)
+            self.canvas.draw_idle()
+            return True
+        except Exception:
+            return False
 
     def merge_file(self):
         """Open additional files and append their series to the existing plot session."""
@@ -963,6 +1263,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._all_columns = all_columns
         self._x_col_name = x_col
         self._merged_mode = False
+        self._main_opened_file_path = path
 
         # Clear existing series and subplots
         self.series_list.clear()
@@ -987,7 +1288,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.update_plot()
         self.setWindowTitle(f'TouCAN-Plot — {basename}')
-        self.show_series_selector()
+        loaded = self._try_load_plot_settings(path)
+        if not loaded:
+            self.show_series_selector()
 
     def _load_blf(self, blf_path, dbc_paths):
         """Load a BLF file using a worker process with live progress."""
@@ -1044,6 +1347,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._all_columns = all_columns
         self._x_col_name = x_col
         self._merged_mode = False
+        self._main_opened_file_path = blf_path
 
         # Clear existing series and subplots
         self.series_list.clear()
@@ -1068,7 +1372,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.update_plot()
         self.setWindowTitle(f'TouCAN-Plot — {basename}')
-        self.show_series_selector()
+        loaded = self._try_load_plot_settings(blf_path)
+        if not loaded:
+            self.show_series_selector()
 
     def _load_mf4(self, path):
         """Load an MF4 file using a worker process with live progress."""
@@ -1125,6 +1431,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._all_columns = all_columns
         self._x_col_name = x_col
         self._merged_mode = False
+        self._main_opened_file_path = path
 
         # Clear existing series and subplots
         self.series_list.clear()
@@ -1149,7 +1456,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.update_plot()
         self.setWindowTitle(f'TouCAN-Plot — {basename}')
-        self.show_series_selector()
+        loaded = self._try_load_plot_settings(path)
+        if not loaded:
+            self.show_series_selector()
 
     def _merge_load_mf4(self, path, prefix):
         """Load an MF4 file and append its series (prefixed) to the existing series_list."""
@@ -1272,6 +1581,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._all_columns = all_columns
         self._x_col_name = x_col
         self._merged_mode = False
+        self._main_opened_file_path = path
 
         # Clear existing series and subplots
         self.series_list.clear()
@@ -1296,7 +1606,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.update_plot()
         self.setWindowTitle(f'TouCAN-Plot — {basename}')
-        self.show_series_selector()
+        loaded = self._try_load_plot_settings(path)
+        if not loaded:
+            self.show_series_selector()
 
     def _merge_load_feather(self, path, prefix):
         """Load a Feather file and append its series (prefixed) to the existing series_list."""

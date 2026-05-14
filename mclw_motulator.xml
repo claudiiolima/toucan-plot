@@ -1,0 +1,27 @@
+<?xml version='1.0' encoding='utf-8'?>
+<toucan_plot_settings version="1" x_axis_column="Time">
+  <default_plot_style legend_show="True" legend_pos="best" legend_orient="vertical" legend_fontsize="12" plot_mode="step" grid_show="True" marker="" />
+  <subplots>
+    <subplot index="0">
+      <config legend_show="true" legend_pos="best" legend_orient="vertical" legend_fontsize="12" plot_mode="step" grid_show="true" marker="" />
+      <labels xlabel="" ylabel_primary="" ylabel_secondary="" />
+      <limits x_min="0.0" x_max="1.5" y_min="-0.03779462575912476" y_max="0.7936871409416199" />
+      <series>
+        <item name="out_0" label="out_0" color="(0.0, 0.0, 1.0, 1.0)" linewidth="1.5" linestyle="-" marker="" yaxis="1" />
+        <item name="out_1" label="out_1" color="(1.0, 0.6470588235294118, 0.0, 1.0)" linewidth="1.5" linestyle="-" marker="" yaxis="1" />
+        <item name="out_2" label="out_2" color="(0.0, 0.5019607843137255, 0.0, 1.0)" linewidth="1.5" linestyle="-" marker="" yaxis="1" />
+      </series>
+    </subplot>
+    <subplot index="1">
+      <config legend_show="true" legend_pos="best" legend_orient="vertical" legend_fontsize="12" plot_mode="step" grid_show="true" marker="" />
+      <labels xlabel="" ylabel_primary="" ylabel_secondary="" />
+      <limits x_min="0.0" x_max="1.5" y_min="-29.363478809595108" y_max="598.7010999023914" />
+      <series>
+        <item name="_$i_{d}$" label="$i_{d}$" color="(0.0, 0.0, 1.0, 1.0)" linewidth="1.5" linestyle="-" marker="" yaxis="1" />
+        <item name="_$i_{q}$" label="$i_{q}$" color="(1.0, 0.6470588235294118, 0.0, 1.0)" linewidth="1.5" linestyle="-" marker="" yaxis="1" />
+        <item name="_$i_{d,ref}$" label="$i_{d,ref}$" color="(0.0, 0.5019607843137255, 0.0, 1.0)" linewidth="1.5" linestyle="--" marker="" yaxis="1" />
+        <item name="_$i_{q,ref}$" label="$i_{q,ref}$" color="(1.0, 0.0, 0.0, 1.0)" linewidth="1.5" linestyle="--" marker="" yaxis="1" />
+      </series>
+    </subplot>
+  </subplots>
+</toucan_plot_settings>
