@@ -2,7 +2,7 @@ import os
 import sys
 import multiprocessing
 import numpy as np
-from PyQt6 import QtWidgets, QtCore, QtGui
+from PySide6 import QtWidgets, QtCore, QtGui
 import matplotlib as mpl
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
