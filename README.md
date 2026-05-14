@@ -1,4 +1,4 @@
-# Toucan-Plot
+# TouCAN-Plot
 
 An interactive PyQt6 + Matplotlib plotting tool for CSV, SMV, and CAN bus log files.
 

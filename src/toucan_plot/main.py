@@ -21,7 +21,7 @@ LEGEND_POSITIONS = [
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle('Toucan-Plot')
+        self.setWindowTitle('TouCAN-Plot')
         self.setWindowIcon(QtGui.QIcon(os.path.join(os.path.dirname(__file__), 'assets', 'ico', 'toucan-plot.ico')))
         self.resize(900, 600)
 
@@ -727,7 +727,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._merged_mode and self.series_list:
             file_names = [f['name'] for f in self._loaded_files]
             self.update_plot()
-            self.setWindowTitle(f'Toucan-Plot — Merged: {", ".join(file_names)}')
+            self.setWindowTitle(f'TouCAN-Plot — Merged: {", ".join(file_names)}')
 
     def open_file(self):
         file_filter = "All supported files (*.csv *.smv *.blf *.trc *.asc *.dbc *.mf4 *.mf4z *.feather);;CSV files (*.csv *.smv);;MF4 files (*.mf4 *.mf4z);;Feather files (*.feather);;CAN files (*.blf *.trc *.asc *.dbc);;All files (*)"
@@ -769,7 +769,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.series_list:
             file_names = [f['name'] for f in self._loaded_files]
             self.update_plot()
-            self.setWindowTitle(f'Toucan-Plot — Merged: {", ".join(file_names)}')
+            self.setWindowTitle(f'TouCAN-Plot — Merged: {", ".join(file_names)}')
             self.show_series_selector()
 
     def _merge_load_csv(self, path, prefix):
@@ -986,7 +986,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._merge_action.setEnabled(True)
 
         self.update_plot()
-        self.setWindowTitle(f'Toucan-Plot — {basename}')
+        self.setWindowTitle(f'TouCAN-Plot — {basename}')
         self.show_series_selector()
 
     def _load_blf(self, blf_path, dbc_paths):
@@ -1067,7 +1067,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._merge_action.setEnabled(True)
 
         self.update_plot()
-        self.setWindowTitle(f'Toucan-Plot — {basename}')
+        self.setWindowTitle(f'TouCAN-Plot — {basename}')
         self.show_series_selector()
 
     def _load_mf4(self, path):
@@ -1148,7 +1148,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._merge_action.setEnabled(True)
 
         self.update_plot()
-        self.setWindowTitle(f'Toucan-Plot — {basename}')
+        self.setWindowTitle(f'TouCAN-Plot — {basename}')
         self.show_series_selector()
 
     def _merge_load_mf4(self, path, prefix):
@@ -1295,7 +1295,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._merge_action.setEnabled(True)
 
         self.update_plot()
-        self.setWindowTitle(f'Toucan-Plot — {basename}')
+        self.setWindowTitle(f'TouCAN-Plot — {basename}')
         self.show_series_selector()
 
     def _merge_load_feather(self, path, prefix):
@@ -2177,7 +2177,7 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(
         prog='toucan-plot',
-        description='Toucan-Plot — Interactive plotting tool for CSV, SMV, and CAN log (BLF/TRC/ASC) files.',
+        description='TouCAN-Plot — Interactive plotting tool for CSV, SMV, and CAN log (BLF/TRC/ASC) files.',
         epilog='BLF, TRC, and ASC files require at least one DBC file for signal decoding.\n'
                'Example: toucan-plot log.blf signals.dbc',
     )

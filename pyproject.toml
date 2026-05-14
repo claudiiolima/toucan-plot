@@ -1,10 +1,14 @@
+[build-system]
+build-backend = "uv_build"
+requires = ["uv-build>=0.11.14,<0.12"]
+
 [project]
 name = "toucan-plot"
-version = "0.3.0"
+version = "0.4.1"
+requires-python = ">=3.13"
 description = "A versatile PyQt6 and Matplotlib-based plotting tool for CSV and SMV data files."
 license = "MIT"
 readme = { file = "README.md", content-type = "text/markdown" }
-requires-python = ">=3.11"
 dependencies = [
     "pyqt6>=6.0",
     "matplotlib>=3.0",
@@ -15,6 +19,7 @@ dependencies = [
     "cantools>=39.0",
     "asammdf>=7.0",
     "pyarrow>=23.0.1",
+    "chardet>=7.4.3",
 ]
 
 [project.scripts]
@@ -25,7 +30,8 @@ toucan_plot = ["assets/**/*.svg", "assets/**/*.ico"]
 
 [dependency-groups]
 dev = [
-    "nuitka>=4.0.7",
+    "nuitka[all]>=4.1",
+    "uv-build>=0.11.14",
     "zstandard>=0.25.0",
 ]
 lint = [

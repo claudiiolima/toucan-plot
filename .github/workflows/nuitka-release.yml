@@ -50,6 +50,11 @@ jobs:
         .\.venv\Scripts\activate
         uv sync
 
+    - name: Retrieve version
+      id: version
+      run: |
+        echo "VERSION=$(uv version --short)" >> "$GITHUB_OUTPUT"
+
     - name: Build
       run: |
         .\.venv\Scripts\activate
@@ -58,13 +63,21 @@ jobs:
     - name: Distribute Executable
       run: |
         .\.venv\Scripts\activate
-        python -m nuitka --onefile --windows-disable-console --assume-yes-for-downloads --follow-imports --enable-plugin=pyqt6 --windows-icon-from-ico=src/toucan_plot/assets/ico/toucan-plot.ico --include-data-dir=src/toucan_plot/assets=assets --include-package=chardet --include-package-data=chardet --include-package=scienceplots --include-package-data=scienceplots src/toucan_plot/main.py --output-filename=dist/toucan-plot.exe
+        uv --no-progress run -- nuitka --mode=standalone --include-package=chardet --include-package=scienceplots --follow-imports --include-package-data=chardet --include-package-data=scienceplots --include-data-dir=src/toucan_plot/assets=assets --include-windows-runtime-dlls=yes --assume-yes-for-downloads --output-folder-name=toucan-plot --windows-console-mode=disable --windows-icon-from-ico=src/toucan_plot/assets/ico/toucan-plot.ico --linux-icon=src/toucan_plot/assets/ico/toucan-plot.png src/toucan_plot/main.py --product-name="TouCAN-Plot" --product-version=${{ steps.version.outputs.VERSION }} --file-description="A versatile PyQt6 and Matplotlib-based plotting tool for CSV and SMV data files." --copyright="Claudio Lima <claudiiolima@gmail.com> and contributors. Distributed under MIT license." --enable-plugin=pyqt6
+        makensis /DVERSION=${{ steps.version.outputs.VERSION }} ./.installer/toucan-plot.nsi
+        move .installer/*.exe dist
+
+    - name: Distribute Portable Executable
+      run: |
+        .\.venv\Scripts\activate
+        uv --no-progress run -- nuitka --mode=onefile --include-package=chardet --include-package=scienceplots --follow-imports --include-package-data=chardet --include-package-data=scienceplots --include-data-dir=src/toucan_plot/assets=assets --include-windows-runtime-dlls=yes --assume-yes-for-downloads --output-filename=dist/toucan-plot-${{ steps.version.outputs.VERSION }}p.exe --windows-console-mode=disable --windows-icon-from-ico=src/toucan_plot/assets/ico/toucan-plot.ico --linux-icon=src/toucan_plot/assets/ico/toucan-plot.png src/toucan_plot/main.py --product-name="TouCAN-Plot" --product-version=${{ steps.version.outputs.VERSION }} --file-description="A versatile PyQt6 and Matplotlib-based plotting tool for CSV and SMV data files." --copyright="Claudio Lima <claudiiolima@gmail.com> and contributors. Distributed under MIT license." --enable-plugin=pyqt6
 
     - name: Create and Upload Release Assets
       uses: softprops/action-gh-release@v2
       with:
         files: |
-          dist/toucan-plot.exe
+          dist/toucan-plot-${{ steps.version.outputs.VERSION }}.exe
+          dist/toucan-plot-${{ steps.version.outputs.VERSION }}p.exe
         generate_release_notes: true # Auto-generates notes from commits
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
