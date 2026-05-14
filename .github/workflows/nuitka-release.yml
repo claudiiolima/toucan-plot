@@ -22,6 +22,7 @@ jobs:
     strategy:
       matrix:
         python-version: ["3.13"]
+        nsis-version: ["3.11"]
 
     steps:
     - uses: actions/checkout@v6
@@ -38,6 +39,11 @@ jobs:
       uses: actions/setup-python@v6
       with:
         python-version: ${{ matrix.python-version }}
+
+    - name: Install NSIS
+      uses: repolevedavaj/install-nsis@v1.2.0
+      with:
+        nsis-version: ${{ matrix.nsis-version }}
 
     - name: Upgrade pip
       run: |
