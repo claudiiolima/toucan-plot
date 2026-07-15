@@ -27,6 +27,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setWindowIcon(QtGui.QIcon(os.path.join(os.path.dirname(__file__), 'assets', 'ico', 'toucan-plot.ico')))
         self.resize(900, 600)
 
+        # Accept drag-and-drop of files onto the window (acts like File -> Open)
+        self.setAcceptDrops(True)
+
         # central widget and layout
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
@@ -1320,6 +1323,45 @@ class MainWindow(QtWidgets.QMainWindow):
         file_filter = "All supported files (*.csv *.smv *.blf *.trc *.asc *.dbc *.mf4 *.mf4z *.feather);;CSV files (*.csv *.smv);;MF4 files (*.mf4 *.mf4z);;Feather files (*.feather);;CAN files (*.blf *.trc *.asc *.dbc);;All files (*)"
         paths, _ = QtWidgets.QFileDialog.getOpenFileNames(self, 'Open File', '', file_filter)
         self.open_files(paths)
+
+    # --- Drag & drop support: dropping files behaves like File -> Open ---
+    _SUPPORTED_DROP_EXTS = (
+        '.csv', '.smv', '.blf', '.trc', '.asc', '.dbc',
+        '.mf4', '.mf4z', '.feather',
+    )
+
+    def _extract_dropped_paths(self, mime_data):
+        """Return a list of local file paths from drop mime data with supported extensions."""
+        if mime_data is None or not mime_data.hasUrls():
+            return []
+        paths = []
+        for url in mime_data.urls():
+            if not url.isLocalFile():
+                continue
+            local_path = url.toLocalFile()
+            if os.path.splitext(local_path)[1].lower() in self._SUPPORTED_DROP_EXTS:
+                paths.append(local_path)
+        return paths
+
+    def dragEnterEvent(self, event):
+        if self._extract_dropped_paths(event.mimeData()):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        if self._extract_dropped_paths(event.mimeData()):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        paths = self._extract_dropped_paths(event.mimeData())
+        if paths:
+            event.acceptProposedAction()
+            self.open_files(paths)
+        else:
+            event.ignore()
 
     def _to_bool_str(self, value):
         return 'true' if bool(value) else 'false'
