@@ -1,4 +1,4 @@
-# TouCAN-Plot
+# <img src="src/toucan_plot/assets/ico/toucan-plot.ico" alt="TouCAN-Plot Icon" width="32" height="32"> TouCAN-Plot
 
 An interactive PySide6 + Matplotlib plotting tool for CSV, SMV, and CAN bus log files.
 

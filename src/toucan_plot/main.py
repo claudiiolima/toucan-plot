@@ -134,6 +134,7 @@ class MainWindow(QtWidgets.QMainWindow):
         plot_widget = QtWidgets.QWidget()
         self.nav_toolbar = NavigationToolbar(self.canvas, self, coordinates=False)
         # Override the Home button to auto-fit all series data
+        navigation_shortcuts = {'Pan': ['P'], 'Zoom': ['Z', 'O']}
         for action in self.nav_toolbar.actions():
             if action.text() in unwanted_buttons:
                 self.nav_toolbar.removeAction(action)
@@ -142,6 +143,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 icon_path = self._icons_buttons[action.text()][self._current_theme]
                 if os.path.exists(icon_path):
                     action.setIcon(QtGui.QIcon(icon_path))
+            if action.text() in navigation_shortcuts:
+                keys = navigation_shortcuts[action.text()]
+                action.setShortcuts([QtGui.QKeySequence(key) for key in keys])
+                action.setShortcutContext(QtCore.Qt.ShortcutContext.WindowShortcut)
+                action.setAutoRepeat(False)
+                action.setToolTip(f"{action.toolTip()} ({' / '.join(keys)})")
             if action.text() == 'Customize':
                 try:
                     action.triggered.disconnect()
