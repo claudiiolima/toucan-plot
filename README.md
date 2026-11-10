@@ -1,4 +1,4 @@
-# <img src="src/toucan_plot/assets/ico/toucan-plot.ico" alt="TouCAN-Plot Icon" width="32" height="32"> TouCAN-Plot
+# <img src="https://raw.githubusercontent.com/claudiiolima/toucan-plot/master/src/toucan_plot/assets/ico/toucan-plot.png" alt="TouCAN-Plot Icon" width="32" height="32"> TouCAN-Plot
 
 An interactive PySide6 + Matplotlib plotting tool for CSV, SMV, and CAN bus log files.
 
@@ -21,6 +21,7 @@ An interactive PySide6 + Matplotlib plotting tool for CSV, SMV, and CAN bus log 
 - Auto-detects `Time` / `timestamp` columns as the default X axis
 - Opening or merging a CAN log without DBC files prompts you to select one or more DBC files, or reuse those from the previous CAN log in the current session
 - CAN signals are named as `Message.Signal` and plotted at their own receive timestamps; markers represent decoded samples
+- When a message appears on more than one CAN channel, each channel gets its own signals, named `CH<channel>.Message.Signal`
 - CAN expressions use a shared, forward-filled timeline to align signals for calculations
 - Loading or merging a CAN log opens a statistics window with duration, frame counts, decoding results, and errors
 
@@ -30,7 +31,7 @@ An interactive PySide6 + Matplotlib plotting tool for CSV, SMV, and CAN bus log 
 - Loading files fits X and every Y axis to the plotted data, including when saved plot settings are restored
 - **Secondary Y axis** support per series
 - **Double-click** a subplot to edit its series, or **right-click** for a context menu
-- **Measure cursors** — two draggable vertical cursors with a live delta table
+- **Measure cursors** — two draggable vertical cursors with signal differences (Δ), time differences (Δt), and their reciprocal (1/Δt); non-time X axes show Δx and 1/Δx
 - **Expression evaluator** — create computed series from math expressions (e.g. `sin("series_A") + "series_B" * 2`)
 - **Multi-file merge** — overlay series from different files, each in its own tab
 - **X axis switching** — reassign the X column without losing subplot configuration
@@ -51,6 +52,7 @@ An interactive PySide6 + Matplotlib plotting tool for CSV, SMV, and CAN bus log 
 | Fit Y          | Auto-fit Y axis keeping current X range |
 | Measure        | Toggle measure cursors                  |
 | X axis         | Select X axis column                    |
+| Theme          | Toggle dark/light theme (top right)      |
 
 ### Menus
 

@@ -80,23 +80,6 @@ class MainWindow(QtWidgets.QMainWindow):
             if style_menu is not None:
                 style_menu.addAction(style_action)
 
-                # Theme submenu
-                theme_menu = style_menu.addMenu('Theme')
-                self._theme_actions = {}
-                theme_group = QtGui.QActionGroup(theme_menu)
-                for theme_name in ('dark', 'light'):
-                    a = QtGui.QAction(theme_name.capitalize(), self)
-                    a.setCheckable(True)
-                    a.setChecked(theme_name == 'dark')
-                    theme_group.addAction(a)
-                    theme_menu.addAction(a)
-                    self._theme_actions[theme_name] = a
-                    def make_theme_handler(t):
-                        def handler():
-                            self._apply_theme(t)
-                        return handler
-                    a.triggered.connect(make_theme_handler(theme_name))
-
         # Icon mappings for toolbar buttons (keyed by theme variant)
         assets_dir = os.path.join(os.path.dirname(__file__), 'assets')
         self._icons_buttons = {
@@ -124,6 +107,8 @@ class MainWindow(QtWidgets.QMainWindow):
                              "light": os.path.join(assets_dir, 'ruler-measure-light.svg') },
             'x_axis':      { "dark": os.path.join(assets_dir, 'math-function-dark.svg'),
                              "light": os.path.join(assets_dir, 'math-function-light.svg') },
+            'theme':       { "dark": os.path.join(assets_dir, 'sun-dark.svg'),
+                             "light": os.path.join(assets_dir, 'moon-light.svg') },
         }
 
         # Current theme ("dark" or "light")
@@ -188,6 +173,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._x_axis_btn.setToolTip('Select X axis series')
         self._x_axis_btn.clicked.connect(self._show_x_axis_dialog)
 
+        self._theme_btn = QtWidgets.QToolButton()
+        self._theme_btn.setObjectName('theme_toggle_button')
+        self._theme_btn.setIconSize(QtCore.QSize(24, 24))
+        self._theme_btn.setAutoRaise(True)
+        self._theme_btn.clicked.connect(
+            lambda: self._apply_theme('light' if self._current_theme == 'dark' else 'dark')
+        )
+
         self.nav_toolbar.setSizePolicy(QtWidgets.QSizePolicy.Policy.Fixed, QtWidgets.QSizePolicy.Policy.Fixed)
         self.nav_toolbar.setStyleSheet("QToolBar { background: transparent; border: none; }")
 
@@ -199,6 +192,7 @@ class MainWindow(QtWidgets.QMainWindow):
         toolbar_layout.addWidget(self.measure_btn)
         toolbar_layout.addWidget(self._x_axis_btn)
         toolbar_layout.addStretch(1)
+        toolbar_layout.addWidget(self._theme_btn)
 
         plot_vlayout = QtWidgets.QVBoxLayout(plot_widget)
         plot_vlayout.setContentsMargins(0, 0, 0, 0)
@@ -1211,10 +1205,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._fit_y_btn.setIcon(QtGui.QIcon(self._extra_btn_icons['fit_y'][theme]))
         self.measure_btn.setIcon(QtGui.QIcon(self._extra_btn_icons['measure'][theme]))
         self._x_axis_btn.setIcon(QtGui.QIcon(self._extra_btn_icons['x_axis'][theme]))
+        self._theme_btn.setIcon(QtGui.QIcon(self._extra_btn_icons['theme'][theme]))
+        next_theme = 'light' if theme == 'dark' else 'dark'
+        self._theme_btn.setToolTip(f'Switch to {next_theme} theme')
+        self._theme_btn.setAccessibleName(f'Switch to {next_theme} theme')
 
-        # Update theme menu checkmarks
-        for t, a in self._theme_actions.items():
-            a.setChecked(t == theme)
         self.update_plot()
 
     def _reload_series_colors(self):
@@ -2689,7 +2684,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._measure_dialog.close()
         dlg = QtWidgets.QDialog(self)
         dlg.setWindowTitle('Measure Values')
-        dlg.setMinimumWidth(420)
+        dlg.setMinimumWidth(640)
         dlg.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose, False)
         layout = QtWidgets.QVBoxLayout(dlg)
         self._measure_table = QtWidgets.QTableWidget()
@@ -2698,6 +2693,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._measure_dialog = dlg
         dlg.show()
         self._update_measure_dialog()
+        table = self._measure_table
+        margins = layout.contentsMargins()
+        table_width = (table.horizontalHeader().length() + table.verticalHeader().sizeHint().width()
+                       + table.verticalScrollBar().sizeHint().width() + 2 * table.frameWidth())
+        width = max(dlg.width(), table_width + margins.left() + margins.right())
+        available_width = max(1, dlg.screen().availableGeometry().width() - 40)
+        dlg.setMinimumWidth(min(640, available_width))
+        dlg.resize(min(width, available_width), dlg.height())
 
     def _update_measure_dialog(self):
         if self._measure_dialog is None or not self._measure_dialog.isVisible():
@@ -2705,14 +2708,29 @@ class MainWindow(QtWidgets.QMainWindow):
         x1, x2 = self._measure_x
         f = float(self.default_freq)
         table = self._measure_table
-        # Columns: Series | Cursor 1 (x1) | Cursor 2 (x2) | Delta
-        table.setColumnCount(4)
+        # Cursor differences use the same units as their corresponding axes.
+        delta_x = x2 - x1
+        x_axis_name = re.split(r'[\s\[(]', self._x_col_name.strip().casefold(), maxsplit=1)[0]
+        is_time_axis = x_axis_name in ('time', 'timestamp', 't')
+        difference_label = 'Δt' if is_time_axis else 'Δx'
+        reciprocal = f'{1.0 / delta_x:.6g}' if delta_x != 0 else '—'
+        table.setColumnCount(6)
         table.setHorizontalHeaderLabels([
             'Series',
             f'Cursor 1 (x={x1:.4f})',
             f'Cursor 2 (x={x2:.4f})',
-            'Delta',
+            'Δ',
+            difference_label,
+            f'1/{difference_label}',
         ])
+        table.horizontalHeaderItem(3).setToolTip('Cursor 2 value − Cursor 1 value')
+        coordinate = 'time' if is_time_axis else 'X'
+        table.horizontalHeaderItem(4).setToolTip(
+            f'Cursor 2 {coordinate} − Cursor 1 {coordinate} (same units as the X axis)'
+        )
+        table.horizontalHeaderItem(5).setToolTip(
+            f'Reciprocal of {difference_label} (inverse X-axis units); undefined when cursors coincide'
+        )
         # Collect all plotted series across subplots
         rows = []
         for subplot_idx, subplot_indices in enumerate(self.subplot_series):
@@ -2747,6 +2765,8 @@ class MainWindow(QtWidgets.QMainWindow):
             table.setItem(r, 1, QtWidgets.QTableWidgetItem(f'{y1:.6f}'))
             table.setItem(r, 2, QtWidgets.QTableWidgetItem(f'{y2:.6f}'))
             table.setItem(r, 3, QtWidgets.QTableWidgetItem(f'{delta:.6f}'))
+            table.setItem(r, 4, QtWidgets.QTableWidgetItem(f'{delta_x:.6f}'))
+            table.setItem(r, 5, QtWidgets.QTableWidgetItem(reciprocal))
         table.resizeColumnsToContents()
 
     def show_series_selector(self):

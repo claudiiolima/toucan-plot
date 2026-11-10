@@ -72,6 +72,14 @@ def _can_reader(path):
     return can.BLFReader(path)
 
 
+def _can_signal_name(channel, message_name, signal_name, message_channels):
+    """Return a signal's display name, qualified only if its message is on several channels."""
+    full_name = f"{message_name}.{signal_name}"
+    if len(message_channels) > 1 and channel is not None:
+        return f"CH{channel}.{full_name}"
+    return full_name
+
+
 def can_log_load_worker(blf_path, dbc_paths, queue):
     """Multiprocessing worker for CAN log loading (BLF/TRC). Sends progress via queue."""
     try:
@@ -82,6 +90,7 @@ def can_log_load_worker(blf_path, dbc_paths, queue):
 
         queue.put(('progress', 10, 'Reading CAN messages...'))
         signal_data = {}
+        channels_by_message = {}
         msg_count = 0
         stats = dict(decoded_frames=0, unknown_id_frames=0, decode_error_frames=0,
                      error_frames=0, remote_frames=0)
@@ -122,15 +131,20 @@ def can_log_load_worker(blf_path, dbc_paths, queue):
                     continue
                 stats['decoded_frames'] += 1
                 t = msg.timestamp
+                channels_by_message.setdefault(db_msg.name, set()).add(msg.channel)
                 for signal_name, value in decoded.items():
-                    full_name = f"{db_msg.name}.{signal_name}"
-                    if full_name not in signal_data:
-                        signal_data[full_name] = []
-                    signal_data[full_name].append((t, float(value)))
+                    key = (msg.channel, db_msg.name, signal_name)
+                    signal_data.setdefault(key, []).append((t, float(value)))
 
         if not signal_data:
             queue.put(('error', 'No CAN messages could be decoded with the provided DBC file(s).'))
             return
+
+        # A message seen on several buses is independent traffic and must not share one trace.
+        signal_data = {
+            _can_signal_name(channel, message_name, signal_name, channels_by_message[message_name]): pairs
+            for (channel, message_name, signal_name), pairs in signal_data.items()
+        }
 
         queue.put(('progress', 60, f'Building time index ({msg_count} messages)...'))
         all_timestamps = set()

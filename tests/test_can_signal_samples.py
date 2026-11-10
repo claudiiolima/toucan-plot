@@ -73,6 +73,35 @@ class CanSignalSamplesTests(unittest.TestCase):
         np.testing.assert_array_equal([0.25, 0.75], slow_x)
         np.testing.assert_array_equal([50, 60], slow_y)
 
+    def test_message_on_several_channels_is_kept_separate_per_channel(self):
+        blf_path = self.path / "multi_channel.blf"
+        with can.BLFWriter(blf_path) as writer:
+            for offset, channel, frame_id, value in (
+                (0.0, 0, 0x100, 40), (0.1, 2, 0x100, 0),
+                (0.2, 0, 0x100, 41), (0.3, 2, 0x100, 0),
+                (0.4, 1, 0x200, 70),
+            ):
+                writer.on_message_received(can.Message(
+                    timestamp=1_700_000_000.0 + offset,
+                    arbitration_id=frame_id,
+                    is_extended_id=False,
+                    channel=channel,
+                    data=[value, 0, 0, 0, 0, 0, 0, 0],
+                ))
+        messages = queue.Queue()
+        can_log_load_worker(str(blf_path), [str(self.dbc_path)], messages)
+        output = []
+        while not messages.empty():
+            output.append(messages.get_nowait())
+        self.assertFalse(any(item[0] == "error" for item in output), output)
+        samples = next(item[1] for item in output if item[0] == "can_samples")
+        columns = next(item[1][1] for item in output if item[0] == "result")
+
+        self.assertEqual({"CH0.Fast.Value", "CH2.Fast.Value", "Slow.Value"}, set(samples))
+        self.assertEqual({"Time", "CH0.Fast.Value", "CH2.Fast.Value", "Slow.Value"}, set(columns))
+        np.testing.assert_allclose([0.0, 0.2], samples["CH0.Fast.Value"][0], rtol=0, atol=1e-6)
+        np.testing.assert_array_equal([40, 41], samples["CH0.Fast.Value"][1])
+        np.testing.assert_array_equal([0, 0], samples["CH2.Fast.Value"][1])
 
     def load_window(self):
         window = MainWindow()
