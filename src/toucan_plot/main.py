@@ -1,17 +1,25 @@
-import os
-import sys
-import multiprocessing
 import ast
-import numpy as np
+import multiprocessing
+import os
+import re
+import sys
 import xml.etree.ElementTree as ET
-from PySide6 import QtWidgets, QtCore, QtGui
-import matplotlib as mpl
-from matplotlib.figure import Figure
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
-from matplotlib.backends.backend_qt import NavigationToolbar2QT as NavigationToolbar
-import qdarktheme
 
-from toucan_plot.utils import styles, csv_load_worker, can_log_load_worker, mf4_load_worker, feather_load_worker
+import matplotlib as mpl
+import numpy as np
+import qdarktheme
+from matplotlib.backends.backend_qt import NavigationToolbar2QT as NavigationToolbar
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
+from PySide6 import QtCore, QtGui, QtWidgets
+
+from toucan_plot.utils import (
+    can_log_load_worker,
+    csv_load_worker,
+    feather_load_worker,
+    mf4_load_worker,
+    styles,
+)
 
 LEGEND_POSITIONS = [
     'best', 'upper right', 'upper left', 'lower left', 'lower right',
@@ -36,7 +44,7 @@ class MainWindow(QtWidgets.QMainWindow):
         layout = QtWidgets.QHBoxLayout(central)
 
         # Matplotlib canvas
-        self.fig = Figure(figsize=(6, 4), dpi=100, facecolor='white')
+        self.fig = Figure(figsize=(6, 4), dpi=100, facecolor='white', constrained_layout=True)
         self.canvas = FigureCanvas(self.fig)
         self.ax = self.fig.add_subplot(111)
         # canvas will be placed inside a vertical container together with the full NavigationToolbar
@@ -225,6 +233,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._skip_xlabel_capture = False  # flag to skip xlabel capture during x-axis change
         self._skip_runtime_style_capture = False  # skip line style capture during explicit dialog applies
         self._merged_mode = False  # True when multiple files are merged
+        self._can_time_origin = None  # Restores standalone CAN elapsed time when entering merge mode
+        self._dbc_paths = []  # DBC files from the most recently decoded CAN log
+        self._reset_x_limits_on_next_plot = False
         # Tracks loaded files: list of {'name': str, 'series_indices': [int, ...]}
         self._loaded_files = []
         self._main_opened_file_path = ''
@@ -271,10 +282,13 @@ class MainWindow(QtWidgets.QMainWindow):
         # Recreate subplots based on self.subplot_series
         f = float(self.default_freq)
         nsubs = len(self.subplot_series)
+        reset_x_limits = self._reset_x_limits_on_next_plot
 
         # Save current axis limits and labels before clearing
         saved_limits = []
+        saved_x_scales = []
         for i, ax in enumerate(getattr(self, 'current_axes', [])):
+            saved_x_scales.append(ax.get_xscale())
             saved_limits.append((ax.get_xlim(), ax.get_ylim()))
             # Capture labels that may have been edited via the navigation toolbar
             if i < len(self.subplot_axes_labels):
@@ -319,6 +333,7 @@ class MainWindow(QtWidgets.QMainWindow):
             # no subplots: clear figure and draw blank canvas
             self.current_axes = []
             self.canvas.draw()
+            self._reset_x_limits_on_next_plot = False
             return
 
         if nsubs == 1:
@@ -335,9 +350,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.current_axes = axes
         self._subplot_axes_map = []
 
+        cycle_colors = mpl.rcParams['axes.prop_cycle'].by_key().get('color', ['C0'])
+
         # Plot each subplot's series
         for idx, series_indices in enumerate(self.subplot_series):
             ax = axes[idx]
+            if idx < len(saved_x_scales):
+                ax.set_xscale(saved_x_scales[idx])
             axis_by_id = {1: ax}
             # retrieve axis labels for this subplot if any
             ax_labels = {'xlabel': '', 'ylabel_primary': '', 'ylabel_secondary': ''}
@@ -357,8 +376,8 @@ class MainWindow(QtWidgets.QMainWindow):
             # Plot each series assigned to this subplot
             subplot_line_artists = []
             for j, series_idx in enumerate(series_indices):
-                name, func, x_data = self.series_list[series_idx]
-                y = func(x_data, f)
+                name = self.series_list[series_idx][0]
+                x_data, y = self._get_series_plot_data(series_idx, f)
                 # get curve properties if present
                 if j < len(props_list):
                     p = props_list[j]
@@ -366,29 +385,29 @@ class MainWindow(QtWidgets.QMainWindow):
                     color = self._parse_color_value(color)
                     lw = p.get('linewidth', 1.5)
                     ls = p.get('linestyle', '')
-                    marker = p.get('marker', '')
+                    marker = p.get('marker', cfg.get('marker', ''))
                     label = p.get('label', name)
                 else:
                     color = ''
                     lw = 1.5
                     ls = ''
-                    marker = ''
+                    marker = cfg.get('marker', '')
                     label = name
                 # choose axis
                 yaxis = 1
                 if j < len(props_list):
                     yaxis = props_list[j].get('yaxis', 1)
 
-                if not marker:
-                    marker = cfg.get('marker', '')
                 label = label.strip('_')  # remove leading/trailing underscores for better math text parsing
-                draw_kwargs = dict(linewidth=lw, label=label)
+                draw_kwargs = {"linewidth": lw, "label": label}
                 if ls:
                     draw_kwargs['linestyle'] = ls
                 if marker:
                     draw_kwargs['marker'] = marker
-                if color:
-                    draw_kwargs['color'] = color
+                    if self._is_can_series(series_idx):
+                        draw_kwargs['markersize'] = 2.0
+                # Captured colors do not advance Matplotlib's automatic cycle.
+                draw_kwargs['color'] = color or cycle_colors[j % len(cycle_colors)]
                 target_ax = ax
                 if yaxis != 1:
                     if yaxis in axis_by_id:
@@ -456,8 +475,11 @@ class MainWindow(QtWidgets.QMainWindow):
             if ax_ylabel:
                 ax.set_ylabel(ax_ylabel, fontsize=axis_text_size)
             ax.tick_params(axis='both', labelsize=axis_text_size)
+            # Only the primary axis draws a grid; presets may enable grids on twinx axes.
+            for axis_obj in axis_by_id.values():
+                axis_obj.grid(False, which='both')
             if cfg.get('grid_show', True):
-                ax.grid(True, color='0.95')
+                ax.grid(True)
             # Legend
             if cfg.get('legend_show', True) and len(series_indices) > 0:
                 ncol = len(series_indices) if cfg.get('legend_orient') == 'horizontal' else 1
@@ -469,8 +491,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 # includes all series across every y-axis after Figure Options edits.
                 for line_idx, line in enumerate(subplot_line_artists):
                     label = line.get_label()
-                    if not label or label.startswith('_'):
-                        if line_idx < len(series_indices):
+                    if not label or label.startswith('_') and line_idx < len(series_indices):
                             series_idx = series_indices[line_idx]
                             if 0 <= series_idx < len(self.series_list):
                                 label = self.series_list[series_idx][0]
@@ -508,15 +529,16 @@ class MainWindow(QtWidgets.QMainWindow):
 
             # Restore saved axis limits if available for this subplot
             if idx < len(saved_limits):
-                ax.set_xlim(saved_limits[idx][0])
+                if not reset_x_limits:
+                    ax.set_xlim(saved_limits[idx][0])
                 ax.set_ylim(saved_limits[idx][1])
 
-        self.fig.tight_layout()
         # Redraw measure lines if active
         if self._measure_active:
             self._draw_measure_lines()
             self._update_measure_dialog()
         self.canvas.draw()
+        self._reset_x_limits_on_next_plot = False
 
     def _make_default_yaxis_settings(self, yaxis_id=1):
         return {
@@ -613,7 +635,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for props in self.subplot_series_props[subplot_idx]:
             available_yaxis_ids.add(int(props.get('yaxis', 1)))
         if subplot_idx < len(self._subplot_axes_map):
-            available_yaxis_ids.update(int(y_id) for y_id in self._subplot_axes_map[subplot_idx].keys())
+            available_yaxis_ids.update(int(y_id) for y_id in self._subplot_axes_map[subplot_idx])
         existing_yaxis_settings = self._get_subplot_yaxis_settings(subplot_idx)
         axis_map_runtime = self._subplot_axes_map[subplot_idx] if subplot_idx < len(self._subplot_axes_map) else {1: axis_obj}
         for yaxis_id in sorted(available_yaxis_ids):
@@ -637,7 +659,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     'color': '',
                     'linewidth': 1.5,
                     'linestyle': '',
-                    'marker': '',
+                    'marker': cfg_state.get('marker', ''),
                     'yaxis': 1,
                 }
             props_state.append(props)
@@ -885,10 +907,20 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _home_autoscale(self, *args):
         """Reset all subplot axes to fit all plotted data."""
-        for ax in getattr(self, 'current_axes', []):
-            ax.relim()
-            ax.autoscale(enable=True, axis='y', tight=False)
-            ax.autoscale(enable=True, axis='x', tight=True)
+        cursor_visibility = [(line, line.get_visible())
+                             for group in self._measure_lines for line in group]
+        try:
+            for line, _ in cursor_visibility:
+                line.set_visible(False)
+            # Rebuild all data limits before fitting axes that share X, including twinx axes.
+            for ax in self.fig.axes:
+                ax.relim(visible_only=True)
+            for ax in self.fig.axes:
+                ax.autoscale(enable=True, axis='y', tight=False)
+                ax.autoscale(enable=True, axis='x', tight=True)
+        finally:
+            for line, visible in cursor_visibility:
+                line.set_visible(visible)
         self.canvas.draw_idle()
 
     def _show_x_axis_dialog(self):
@@ -1151,8 +1183,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _apply_theme(self, theme):
         """Switch between 'dark' and 'light' themes."""
+        theme_changed = theme != self._current_theme
         self._current_theme = theme
         qdarktheme.setup_theme(theme)
+        self.available_plot_presets[self.selected_plot_preset]()
+        styles.apply_plot_theme(theme, self.selected_plot_preset)
+        self.fig.set_facecolor(mpl.rcParams['figure.facecolor'])
+        if theme_changed:
+            self._reload_series_colors()
 
         # Update navigation toolbar icons
         for action in self.nav_toolbar.actions():
@@ -1170,9 +1208,46 @@ class MainWindow(QtWidgets.QMainWindow):
         # Update theme menu checkmarks
         for t, a in self._theme_actions.items():
             a.setChecked(t == theme)
+        self.update_plot()
+
+    def _reload_series_colors(self):
+        colors = mpl.rcParams['axes.prop_cycle'].by_key().get('color', ['C0'])
+        for props_list in self.subplot_series_props:
+            for j, props in enumerate(props_list):
+                props['color'] = colors[j % len(colors)]
+        # Recolor artists before capture so previous colors cannot override the palette.
+        for line_artists in self._plotted_line_artists:
+            for j, line in enumerate(line_artists):
+                line.set_color(colors[j % len(colors)])
 
     def _make_default_subplot_config(self):
         return dict(self.default_plot_style)
+
+    def _set_can_samples(self, file_entry, can_samples, time_axis, prefix=''):
+        """Map native CAN samples to the aligned arrays without discarding duplicates."""
+        file_entry['can_samples'] = {
+            prefix + name: (np.searchsorted(time_axis, timestamps), values)
+            for name, (timestamps, values) in can_samples.items()
+        }
+
+    def _get_series_plot_data(self, series_idx, frequency):
+        """Use decoded samples for CAN curves and aligned arrays for calculations."""
+        name, func, x_data = self.series_list[series_idx]
+        for file_entry in self._loaded_files:
+            if series_idx in file_entry['series_indices']:
+                samples = file_entry.get('can_samples', {}).get(name)
+                if samples is not None:
+                    indices, values = samples
+                    return np.asarray(x_data)[indices], values
+                break
+        return x_data, func(x_data, frequency)
+
+    def _is_can_series(self, series_idx):
+        for file_entry in self._loaded_files:
+            if series_idx in file_entry['series_indices']:
+                extension = os.path.splitext(file_entry['name'])[1].lower()
+                return extension in ('.blf', '.trc', '.asc')
+        return False
 
     def show_plot_style_dialog(self):
         dlg = QtWidgets.QDialog(self)
@@ -1229,18 +1304,17 @@ class MainWindow(QtWidgets.QMainWindow):
 
         def apply_style():
             selected_preset = preset_combo.currentText()
+            preset_changed = False
             preset_fn = self.available_plot_presets.get(selected_preset)
             if preset_fn is not None:
                 try:
                     preset_fn()
+                    preset_changed = selected_preset != self.selected_plot_preset
                     self.selected_plot_preset = selected_preset
+                    styles.apply_plot_theme(self._current_theme, selected_preset)
                 except Exception as e:
                     QtWidgets.QMessageBox.warning(self, 'Style error', f'Failed to apply preset {selected_preset}:\n{e}')
 
-            if grid_show_check.isChecked() is True:
-                mpl.rcParams['axes.grid'] = True
-                mpl.rcParams['grid.alpha'] = 1.0
-                mpl.rcParams['grid.linewidth'] = 0.8
             mpl.rcParams['lines.markersize'] = mpl.rcParams['lines.linewidth'] * 2.0
 
             new_defaults = {
@@ -1255,8 +1329,18 @@ class MainWindow(QtWidgets.QMainWindow):
             self.default_plot_style = dict(new_defaults)
 
             if apply_existing_check.isChecked():
-                for i in range(len(self.subplot_config)):
-                    self.subplot_config[i] = dict(new_defaults)
+                self.subplot_config = [dict(new_defaults) for _ in self.subplot_series]
+                for props_list in self.subplot_series_props:
+                    for props in props_list:
+                        props['marker'] = new_defaults['marker']
+                # Update artists too so runtime capture preserves the chosen marker
+                # alongside any other edits made with Matplotlib's toolbar.
+                for line_artists in self._plotted_line_artists:
+                    for line in line_artists:
+                        line.set_marker(new_defaults['marker'] or 'None')
+
+            if preset_changed:
+                self._reload_series_colors()
 
             self.update_plot()
 
@@ -1269,15 +1353,47 @@ class MainWindow(QtWidgets.QMainWindow):
         buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Apply).clicked.connect(apply_style)
         dlg.exec()
 
+    def _select_dbc_files(self, can_path):
+        if self._dbc_paths:
+            question = QtWidgets.QMessageBox(self)
+            question.setWindowTitle('DBC files for CAN log')
+            question.setIcon(QtWidgets.QMessageBox.Icon.Question)
+            question.setText(f'Reuse the previous DBC files for {os.path.basename(can_path)}?')
+            question.setInformativeText('\n'.join(self._dbc_paths))
+            layout = question.layout()
+            layout.addItem(QtWidgets.QSpacerItem(720, 0), layout.rowCount(), 0, 1, layout.columnCount())
+            reuse_button = question.addButton('Reuse DBC files', QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+            other_button = question.addButton('Choose other DBC files', QtWidgets.QMessageBox.ButtonRole.ActionRole)
+            cancel_button = question.addButton(QtWidgets.QMessageBox.StandardButton.Cancel)
+            question.setDefaultButton(reuse_button)
+            question.setEscapeButton(cancel_button)
+            question.exec()
+            if question.clickedButton() == reuse_button:
+                return list(self._dbc_paths)
+            if question.clickedButton() != other_button:
+                return []
+
+        paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            self, f'Select DBC files for {os.path.basename(can_path)}',
+            os.path.dirname(os.path.abspath(can_path)), 'DBC files (*.dbc)',
+        )
+        return paths
+
     def open_files(self, paths):
         """Load a list of file paths. The first data file is opened normally; any additional files are merged."""
         if not paths:
             return
+        previous_file = self._loaded_files[-1] if self._loaded_files else None
         blf_files = [p for p in paths if os.path.splitext(p)[1].lower() in ('.blf', '.trc', '.asc')]
         dbc_files = [p for p in paths if os.path.splitext(p)[1].lower() == '.dbc']
         csv_files = [p for p in paths if os.path.splitext(p)[1].lower() in ('.csv', '.smv')]
         mf4_files = [p for p in paths if os.path.splitext(p)[1].lower() in ('.mf4', '.mf4z')]
         feather_files = [p for p in paths if os.path.splitext(p)[1].lower() == '.feather']
+
+        if blf_files and not dbc_files:
+            dbc_files = self._select_dbc_files(blf_files[0])
+            if not dbc_files:
+                return
 
         first_loaded = False
 
@@ -1287,7 +1403,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     self._load_blf(blf_path, dbc_files)
                     first_loaded = True
                 else:
-                    self._merged_mode = True
+                    self._enable_merged_mode()
                     self._merge_load_blf(blf_path, dbc_paths=dbc_files, prefix=os.path.basename(blf_path))
 
         for path in csv_files:
@@ -1295,7 +1411,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._load_csv(path)
                 first_loaded = True
             else:
-                self._merged_mode = True
+                self._enable_merged_mode()
                 self._merge_load_csv(path, os.path.basename(path))
 
         for path in mf4_files:
@@ -1303,7 +1419,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._load_mf4(path)
                 first_loaded = True
             else:
-                self._merged_mode = True
+                self._enable_merged_mode()
                 self._merge_load_mf4(path, os.path.basename(path))
 
         for path in feather_files:
@@ -1311,13 +1427,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._load_feather(path)
                 first_loaded = True
             else:
-                self._merged_mode = True
+                self._enable_merged_mode()
                 self._merge_load_feather(path, os.path.basename(path))
 
         if self._merged_mode and self.series_list:
             file_names = [f['name'] for f in self._loaded_files]
             self.update_plot()
             self.setWindowTitle(f'TouCAN-Plot — Merged: {", ".join(file_names)}')
+            if self._loaded_files and self._loaded_files[-1] is not previous_file:
+                self._home_autoscale()
 
     def open_file(self):
         file_filter = "All supported files (*.csv *.smv *.blf *.trc *.asc *.dbc *.mf4 *.mf4z *.feather);;CSV files (*.csv *.smv);;MF4 files (*.mf4 *.mf4z);;Feather files (*.feather);;CAN files (*.blf *.trc *.asc *.dbc);;All files (*)"
@@ -1617,7 +1735,11 @@ class MainWindow(QtWidgets.QMainWindow):
                         for item_el in series_el.findall('item'):
                             s_name = item_el.get('name', '')
                             if s_name not in name_to_index:
-                                continue
+                                try:
+                                    name_to_index[s_name] = self._add_expression_series(s_name)
+                                except Exception:
+                                    # Missing signals or invalid formulas cannot be restored.
+                                    continue
                             sidx = name_to_index[s_name]
                             indices.append(sidx)
                             props.append({
@@ -1650,6 +1772,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.subplot_yaxis_settings = new_subplot_yaxis_settings
             self.subplot_config = new_subplot_config
 
+            if self._current_theme == 'dark':
+                self._reload_series_colors()
             self.update_plot()
             axes = getattr(self, 'current_axes', [])
             for i, limits in enumerate(pending_limits):
@@ -1672,13 +1796,19 @@ class MainWindow(QtWidgets.QMainWindow):
         if not paths:
             return
 
-        self._merged_mode = True
-
+        previous_file = self._loaded_files[-1] if self._loaded_files else None
         blf_files = [p for p in paths if os.path.splitext(p)[1].lower() in ('.blf', '.trc', '.asc')]
         dbc_files = [p for p in paths if os.path.splitext(p)[1].lower() == '.dbc']
         csv_files = [p for p in paths if os.path.splitext(p)[1].lower() in ('.csv', '.smv')]
         mf4_files = [p for p in paths if os.path.splitext(p)[1].lower() in ('.mf4', '.mf4z')]
         feather_files = [p for p in paths if os.path.splitext(p)[1].lower() == '.feather']
+
+        if blf_files and not dbc_files:
+            dbc_files = self._select_dbc_files(blf_files[0])
+            if not dbc_files:
+                return
+
+        self._enable_merged_mode()
 
         for path in csv_files:
             basename = os.path.basename(path)
@@ -1702,6 +1832,149 @@ class MainWindow(QtWidgets.QMainWindow):
             self.update_plot()
             self.setWindowTitle(f'TouCAN-Plot — Merged: {", ".join(file_names)}')
             self.show_series_selector()
+            if self._loaded_files and self._loaded_files[-1] is not previous_file:
+                self._home_autoscale()
+
+    def _enable_merged_mode(self):
+        """Enter merge mode and restore an existing CAN log's absolute timestamps."""
+        if self._merged_mode:
+            return
+
+        if self._can_time_origin is not None:
+            time_origin = self._can_time_origin
+            was_time_axis = self._x_col_name == 'Time'
+            if not was_time_axis and 'Time' in self._all_columns:
+                self._restore_existing_can_time_axis(self._can_time_origin)
+            else:
+                self.series_list = [
+                    (name, func, np.asarray(x_data) + time_origin)
+                    for name, func, x_data in self.series_list
+                ]
+            if getattr(self, '_measure_active', False):
+                if was_time_axis:
+                    self._measure_x = [
+                        None if x_pos is None else x_pos + time_origin
+                        for x_pos in self._measure_x
+                    ]
+                else:
+                    absolute_time = np.asarray(self._all_columns['Time']) + time_origin
+                    time_min = float(np.min(absolute_time))
+                    time_span = float(np.max(absolute_time) - time_min)
+                    self._measure_x = [
+                        time_min + time_span * 0.33,
+                        time_min + time_span * 0.66,
+                    ]
+            self._can_time_origin = None
+            self._reset_x_limits_on_next_plot = True
+
+        self._merged_mode = True
+
+    def _restore_existing_can_time_axis(self, time_origin):
+        """Rebuild a standalone CAN session on absolute time without losing expressions."""
+        absolute_time = np.asarray(self._all_columns['Time']) + time_origin
+        old_series = list(self.series_list)
+        old_to_new = {}
+        rebuilt_series = []
+
+        primary_indices = set()
+        if self._loaded_files:
+            primary_indices.update(self._loaded_files[0]['series_indices'])
+
+        primary_name_to_index = {}
+        primary_new_indices = []
+        for name, data in self._all_columns.items():
+            if name == 'Time':
+                continue
+            new_idx = len(rebuilt_series)
+            rebuilt_series.append((name, lambda x, f, _d=data: _d, absolute_time))
+            primary_name_to_index[name] = new_idx
+            primary_new_indices.append(new_idx)
+
+        for old_idx in primary_indices:
+            if 0 <= old_idx < len(old_series):
+                old_name = old_series[old_idx][0]
+                if old_name in primary_name_to_index:
+                    old_to_new[old_idx] = primary_name_to_index[old_name]
+
+        if self._loaded_files:
+            self._loaded_files[0]['series_indices'] = primary_new_indices
+
+        for file_entry in self._loaded_files[1:]:
+            remapped_file_indices = []
+            for old_idx in file_entry['series_indices']:
+                if not 0 <= old_idx < len(old_series):
+                    continue
+                name, func, old_x = old_series[old_idx]
+                expression_x = absolute_time if len(old_x) == len(absolute_time) else old_x
+                new_idx = len(rebuilt_series)
+                rebuilt_series.append((name, func, expression_x))
+                old_to_new[old_idx] = new_idx
+                remapped_file_indices.append(new_idx)
+            file_entry['series_indices'] = remapped_file_indices
+
+        remapped_subplot_series = []
+        remapped_subplot_props = []
+        remapped_subplot_labels = []
+        remapped_subplot_yaxis_settings = []
+        remapped_subplot_config = []
+        for sub_idx, old_indices in enumerate(self.subplot_series):
+            new_indices = []
+            new_props = []
+            props = self.subplot_series_props[sub_idx] if sub_idx < len(self.subplot_series_props) else []
+            for prop_idx, old_idx in enumerate(old_indices):
+                if old_idx not in old_to_new:
+                    continue
+                new_indices.append(old_to_new[old_idx])
+                if prop_idx < len(props):
+                    new_props.append(props[prop_idx])
+            if not new_indices:
+                continue
+            remapped_subplot_series.append(new_indices)
+            remapped_subplot_props.append(new_props)
+            remapped_subplot_labels.append(
+                self.subplot_axes_labels[sub_idx] if sub_idx < len(self.subplot_axes_labels)
+                else {'xlabel': '', 'ylabel_primary': '', 'ylabel_secondary': ''}
+            )
+            remapped_subplot_yaxis_settings.append(
+                self.subplot_yaxis_settings[sub_idx] if sub_idx < len(self.subplot_yaxis_settings)
+                else {1: self._make_default_yaxis_settings(1)}
+            )
+            remapped_subplot_config.append(
+                self.subplot_config[sub_idx] if sub_idx < len(self.subplot_config)
+                else self._make_default_subplot_config()
+            )
+
+        self.series_list = rebuilt_series
+        self.subplot_series = remapped_subplot_series
+        self.subplot_series_props = remapped_subplot_props
+        self.subplot_axes_labels = remapped_subplot_labels
+        self.subplot_yaxis_settings = remapped_subplot_yaxis_settings
+        self.subplot_config = remapped_subplot_config
+        self._x_col_name = 'Time'
+        for labels in self.subplot_axes_labels:
+            labels['xlabel'] = ''
+
+    def _append_merged_columns(self, x_col, all_columns, prefix, time_origin=None, can_samples=None):
+        """Append loaded columns, restoring a CAN log's absolute time when provided."""
+        x_array = all_columns[x_col]
+        if time_origin is not None:
+            x_array = x_array + time_origin
+
+        if len(self.series_list) == 0:
+            self._x_col_name = x_col
+
+        file_entry = {'name': prefix, 'series_indices': []}
+        for name in all_columns:
+            if name == x_col:
+                continue
+            data = all_columns[name]
+            prefixed_name = f'{prefix}: {name}'
+            idx = len(self.series_list)
+            self.series_list.append((prefixed_name, lambda x, f, _d=data: _d, x_array))
+            file_entry['series_indices'].append(idx)
+        if can_samples is not None:
+            self._set_can_samples(file_entry, can_samples, all_columns[x_col], prefix=f'{prefix}: ')
+        self._loaded_files.append(file_entry)
 
     def _merge_load_csv(self, path, prefix):
         """Load a CSV/SMV file and append its series (prefixed) to the existing series_list."""
@@ -1752,23 +2025,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         x_col, all_columns = result_data['data']
-        x_array = all_columns[x_col]
-
-        # Use the first file's x as the default for measure cursor placement
-        if len(self.series_list) == 0:
-            self._x_col_name = x_col
-
-        # Append series with file prefix and track file
-        file_entry = {'name': prefix, 'series_indices': []}
-        for name in all_columns:
-            if name == x_col:
-                continue
-            data = all_columns[name]
-            prefixed_name = f'{prefix}: {name}'
-            idx = len(self.series_list)
-            self.series_list.append((prefixed_name, lambda x, f, _d=data: _d, x_array))
-            file_entry['series_indices'].append(idx)
-        self._loaded_files.append(file_entry)
+        self._append_merged_columns(x_col, all_columns, prefix)
 
     def _merge_load_blf(self, blf_path, dbc_paths, prefix):
         """Load a BLF/TRC/ASC file and append its series (prefixed) to the existing series_list."""
@@ -1794,6 +2051,10 @@ class MainWindow(QtWidgets.QMainWindow):
                             progress.setValue(pct)
                         if label:
                             progress.setLabelText(label)
+                    elif msg[0] == 'can_samples':
+                        result_data['can_samples'] = msg[1]
+                    elif msg[0] == 'can_statistics':
+                        result_data['statistics'] = msg[1]
                     elif msg[0] == 'result':
                         result_data['data'] = msg[1]
                         progress.setValue(100)
@@ -1818,24 +2079,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if 'data' not in result_data:
             return
 
-        x_col, all_columns = result_data['data']
-        x_array = all_columns[x_col]
-
-        # Use the first file's x as the default for measure cursor placement
-        if len(self.series_list) == 0:
-            self._x_col_name = x_col
-
-        # Append series with file prefix and track file
-        file_entry = {'name': prefix, 'series_indices': []}
-        for name in all_columns:
-            if name == x_col:
-                continue
-            data = all_columns[name]
-            prefixed_name = f'{prefix}: {name}'
-            idx = len(self.series_list)
-            self.series_list.append((prefixed_name, lambda x, f, _d=data: _d, x_array))
-            file_entry['series_indices'].append(idx)
-        self._loaded_files.append(file_entry)
+        x_col, all_columns, time_origin = result_data['data']
+        self._dbc_paths = list(dbc_paths)
+        self._append_merged_columns(
+            x_col, all_columns, prefix, time_origin=time_origin,
+            can_samples=result_data.get('can_samples', {}),
+        )
+        self._show_can_statistics(blf_path, result_data['statistics'])
 
     def _load_csv(self, path):
         """Load a CSV/SMV file using a worker process with live progress."""
@@ -1891,6 +2141,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._all_columns = all_columns
         self._x_col_name = x_col
         self._merged_mode = False
+        self._can_time_origin = None
         self._main_opened_file_path = path
 
         # Clear existing series and subplots
@@ -1920,6 +2171,28 @@ class MainWindow(QtWidgets.QMainWindow):
         loaded = self._try_load_plot_settings(path)
         if not loaded:
             self.show_series_selector()
+        self._home_autoscale()
+
+    def _show_can_statistics(self, path, stats):
+        """Show statistics collected during the CAN log's decoding pass."""
+        duration = stats['duration']
+        rate = f"{stats['total_frames'] / duration:.2f} frames/s" if duration > 0 else 'N/A'
+        channels = ', '.join(str(channel) for channel in stats['channels']) or 'N/A'
+        summary = (
+            f"File: {os.path.basename(path)}\n\n"
+            f"Duration: {duration:.3f} s\n"
+            f"Total frames: {stats['total_frames']}\n"
+            f"Average frame rate: {rate}\n"
+            f"Channels: {channels}\n"
+            f"Unique CAN IDs: {stats['unique_ids']}\n\n"
+            f"Decoded frames: {stats['decoded_frames']}\n"
+            f"Decoded signals: {stats['decoded_signals']}\n"
+            f"Unknown ID frames (not in DBC): {stats['unknown_id_frames']}\n"
+            f"Decoding failures: {stats['decode_error_frames']}\n"
+            f"Error frames: {stats['error_frames']}\n"
+            f"Remote frames: {stats['remote_frames']}"
+        )
+        QtWidgets.QMessageBox.information(self, 'CAN statistics', summary)
 
     def _load_blf(self, blf_path, dbc_paths):
         """Load a BLF file using a worker process with live progress."""
@@ -1945,6 +2218,10 @@ class MainWindow(QtWidgets.QMainWindow):
                             progress.setValue(pct)
                         if label:
                             progress.setLabelText(label)
+                    elif msg[0] == 'can_samples':
+                        result_data['can_samples'] = msg[1]
+                    elif msg[0] == 'can_statistics':
+                        result_data['statistics'] = msg[1]
                     elif msg[0] == 'result':
                         result_data['data'] = msg[1]
                         progress.setValue(100)
@@ -1969,12 +2246,14 @@ class MainWindow(QtWidgets.QMainWindow):
         if 'data' not in result_data:
             return
 
-        x_col, all_columns = result_data['data']
+        x_col, all_columns, time_origin = result_data['data']
+        self._dbc_paths = list(dbc_paths)
         x_array = all_columns[x_col]
 
         self._all_columns = all_columns
         self._x_col_name = x_col
         self._merged_mode = False
+        self._can_time_origin = time_origin
         self._main_opened_file_path = blf_path
 
         # Clear existing series and subplots
@@ -1996,14 +2275,17 @@ class MainWindow(QtWidgets.QMainWindow):
             idx = len(self.series_list)
             self.series_list.append((name, lambda x, f, _d=data: _d, x_array))
             file_entry['series_indices'].append(idx)
+        self._set_can_samples(file_entry, result_data.get('can_samples', {}), x_array)
         self._loaded_files.append(file_entry)
         self._merge_action.setEnabled(True)
 
         self.update_plot()
         self.setWindowTitle(f'TouCAN-Plot — {basename}')
+        self._show_can_statistics(blf_path, result_data['statistics'])
         loaded = self._try_load_plot_settings(blf_path)
         if not loaded:
             self.show_series_selector()
+        self._home_autoscale()
 
     def _load_mf4(self, path):
         """Load an MF4 file using a worker process with live progress."""
@@ -2059,6 +2341,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._all_columns = all_columns
         self._x_col_name = x_col
         self._merged_mode = False
+        self._can_time_origin = None
         self._main_opened_file_path = path
 
         # Clear existing series and subplots
@@ -2088,6 +2371,7 @@ class MainWindow(QtWidgets.QMainWindow):
         loaded = self._try_load_plot_settings(path)
         if not loaded:
             self.show_series_selector()
+        self._home_autoscale()
 
     def _merge_load_mf4(self, path, prefix):
         """Load an MF4 file and append its series (prefixed) to the existing series_list."""
@@ -2208,6 +2492,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._all_columns = all_columns
         self._x_col_name = x_col
         self._merged_mode = False
+        self._can_time_origin = None
         self._main_opened_file_path = path
 
         # Clear existing series and subplots
@@ -2237,6 +2522,7 @@ class MainWindow(QtWidgets.QMainWindow):
         loaded = self._try_load_plot_settings(path)
         if not loaded:
             self.show_series_selector()
+        self._home_autoscale()
 
     def _merge_load_feather(self, path, prefix):
         """Load a Feather file and append its series (prefixed) to the existing series_list."""
@@ -2340,7 +2626,8 @@ class MainWindow(QtWidgets.QMainWindow):
         for ax in self.current_axes:
             lines_for_ax = []
             for i, xpos in enumerate(self._measure_x):
-                color = 'red' if i == 0 else 'blue'
+                cursor_colors = ('#FF8A80', '#82B1FF') if self._current_theme == 'dark' else ('red', 'blue')
+                color = cursor_colors[i]
                 line = ax.axvline(x=xpos, color=color, linestyle='--', linewidth=1.0, picker=5)
                 lines_for_ax.append(line)
             self._measure_lines.append(lines_for_ax)
@@ -2421,12 +2708,31 @@ class MainWindow(QtWidgets.QMainWindow):
         ])
         # Collect all plotted series across subplots
         rows = []
-        for subplot_indices in self.subplot_series:
+        for subplot_idx, subplot_indices in enumerate(self.subplot_series):
+            cfg = dict(self.default_plot_style)
+            if subplot_idx < len(self.subplot_config):
+                cfg.update(self.subplot_config[subplot_idx])
             for series_idx in subplot_indices:
-                name, func, x_data = self.series_list[series_idx]
-                y_data = func(x_data, f)
-                y1 = float(np.interp(x1, x_data, y_data))
-                y2 = float(np.interp(x2, x_data, y_data))
+                name = self.series_list[series_idx][0]
+                x_data, y_data = self._get_series_plot_data(series_idx, f)
+                if self._is_can_series(series_idx):
+                    # A selected X signal may not yet exist at the first Y sample.
+                    finite_x = np.isfinite(x_data)
+                    sample_x = np.asarray(x_data)[finite_x]
+                    sample_y = np.asarray(y_data)[finite_x]
+                    positions = np.array([x1, x2])
+                    values = np.full(2, np.nan)
+                    if len(sample_x):
+                        if cfg.get('plot_mode', 'step') == 'step':
+                            indices = np.searchsorted(sample_x, positions, side='right') - 1
+                            valid = (positions >= sample_x[0]) & (positions <= sample_x[-1])
+                            values[valid] = sample_y[indices[valid]]
+                        else:
+                            values = np.interp(positions, sample_x, sample_y, left=np.nan, right=np.nan)
+                    y1, y2 = values
+                else:
+                    y1 = float(np.interp(x1, x_data, y_data))
+                    y2 = float(np.interp(x2, x_data, y_data))
                 rows.append((name, y1, y2, y2 - y1))
         table.setRowCount(len(rows))
         for r, (name, y1, y2, delta) in enumerate(rows):
@@ -2456,7 +2762,75 @@ class MainWindow(QtWidgets.QMainWindow):
         # For a new subplot, initial plotted list is empty
         self._open_series_editor(initial_plotted=[], on_accept=_on_accept, initial_props=[], initial_axes={})
 
-    def _open_series_editor(self, initial_plotted, on_accept, initial_props=None, initial_axes=None):
+    def _add_expression_series(self, expression):
+        """Evaluate a formula and register its series for editing and settings reload."""
+        token_pattern = re.compile(r'"([^"]+)"')
+        tokens = token_pattern.findall(expression)
+        if not tokens:
+            raise ValueError('No series references found. Use "series_name" to reference a series.')
+
+        series_by_name = {name: (func, x) for name, func, x in self.series_list}
+        for token in tokens:
+            if token not in series_by_name:
+                raise ValueError(f'Series not found: {token}')
+        expr_x = series_by_name[tokens[0]][1]
+        variables = {}
+        token_variables = {}
+        for token in dict.fromkeys(tokens):
+            func, source_x = series_by_name[token]
+            values = func(source_x, float(self.default_freq))
+            variable = f'_s{len(token_variables)}'
+            token_variables[token] = variable
+            if not (source_x is expr_x or (len(source_x) == len(expr_x) and np.allclose(source_x, expr_x))):
+                values = np.interp(expr_x, source_x, values)
+            # NumPy output arguments must never overwrite recording signals.
+            values = np.asarray(values).view()
+            values.setflags(write=False)
+            variables[variable] = values
+
+        eval_expr = token_pattern.sub(lambda match: token_variables[match.group(1)], expression)
+        math_functions = {
+            'sin': np.sin, 'cos': np.cos, 'tan': np.tan,
+            'abs': np.abs, 'sqrt': np.sqrt, 'exp': np.exp,
+            'log': np.log, 'log10': np.log10,
+            'arcsin': np.arcsin, 'arccos': np.arccos, 'arctan': np.arctan,
+            'clip': np.clip, 'sign': np.sign,
+        }
+        namespace = dict(math_functions, pi=np.pi, e=np.e, **variables)
+        # Settings files are evaluated automatically: accept only numeric math syntax.
+        tree = ast.parse(eval_expr, mode='eval')
+        allowed_nodes = (
+            ast.Expression, ast.BinOp, ast.UnaryOp, ast.Call, ast.Name, ast.Load,
+            ast.Constant, ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv,
+            ast.Mod, ast.Pow, ast.UAdd, ast.USub, ast.Compare, ast.Lt, ast.LtE,
+            ast.Gt, ast.GtE, ast.Eq, ast.NotEq, ast.BitAnd, ast.BitOr, ast.BitXor,
+            ast.Invert, ast.keyword,
+        )
+        for node in ast.walk(tree):
+            if not isinstance(node, allowed_nodes):
+                raise TypeError('Unsupported expression syntax.')
+            if isinstance(node, ast.Name) and node.id not in namespace:
+                raise ValueError(f'Unknown name: {node.id}')
+            if isinstance(node, ast.Call) and (
+                    not isinstance(node.func, ast.Name) or node.func.id not in math_functions):
+                raise ValueError('Only supported math functions can be called.')
+            if isinstance(node, ast.Constant) and not isinstance(node.value, (int, float)):
+                raise TypeError('Only numeric constants are supported.')
+        result = eval(compile(tree, '<expression>', 'eval'), {'__builtins__': {}}, namespace)
+        result = np.asarray(result, dtype=float)
+        if result.shape != expr_x.shape:
+            result = np.broadcast_to(result, expr_x.shape).copy()
+
+        index = len(self.series_list)
+        self.series_list.append((expression, lambda x, f, data=result: data, expr_x))
+        expr_file = next((fe for fe in self._loaded_files if fe['name'] == '(Expressions)'), None)
+        if expr_file is None:
+            expr_file = {'name': '(Expressions)', 'series_indices': []}
+            self._loaded_files.append(expr_file)
+        expr_file['series_indices'].append(index)
+        return index
+
+    def _open_series_editor(self, initial_plotted, on_accept, initial_props=None, initial_axes=None, default_marker=None):
         """Open a modal editor to select series for a subplot.
 
         When multiple files are loaded, the available series panel shows one tab per file.
@@ -2505,8 +2879,7 @@ class MainWindow(QtWidgets.QMainWindow):
             yaxis_val = 1
             if j < len(initial_props):
                 yaxis_val = int(initial_props[j].get('yaxis', 1))
-            if yaxis_val < 1:
-                yaxis_val = 1
+            yaxis_val = max(yaxis_val, 1)
             initial_yaxis_by_series[sidx] = yaxis_val
 
         def _refresh_plotted_item_text(item):
@@ -2651,85 +3024,15 @@ class MainWindow(QtWidgets.QMainWindow):
             if not expr_text:
                 return
 
-            # Build a mapping of series name -> (data_array, x_array)
-            series_map = {}
-            for sname, sfunc, sx in self.series_list:
-                y_data = sfunc(sx, float(self.default_freq))
-                series_map[sname] = (y_data, sx)
-
-            # Replace "series_name" tokens with placeholder variable names
-            import re
-            token_pattern = re.compile(r'"([^"]+)"')
-            tokens_found = token_pattern.findall(expr_text)
-
-            if not tokens_found:
-                QtWidgets.QMessageBox.warning(dlg, 'Expression Error',
-                    'No series references found.\nUse "series_name" to reference a series.')
-                return
-
-            # Validate all referenced series exist
-            for tok in tokens_found:
-                if tok not in series_map:
-                    QtWidgets.QMessageBox.warning(dlg, 'Expression Error',
-                        f'Series not found: {tok}')
-                    return
-
-            # Determine x_data: use the x from the first referenced series
-            first_ref = tokens_found[0]
-            expr_x = series_map[first_ref][1]
-
-            # For series with different x-axes, interpolate onto the first one
-            var_arrays = {}
-            for i, tok in enumerate(tokens_found):
-                y_data, tok_x = series_map[tok]
-                var_name = f'_s{i}'
-                if tok_x is expr_x or (len(tok_x) == len(expr_x) and np.allclose(tok_x, expr_x)):
-                    var_arrays[var_name] = y_data
-                else:
-                    var_arrays[var_name] = np.interp(expr_x, tok_x, y_data)
-
-            # Build the evaluable expression by replacing tokens with variable names
-            eval_expr = expr_text
-            for i, tok in enumerate(tokens_found):
-                eval_expr = eval_expr.replace('"' + tok + '"', f'_s{i}')
-
-            # Safe math namespace
-            safe_ns = {
-                '__builtins__': {},
-                'sin': np.sin, 'cos': np.cos, 'tan': np.tan,
-                'abs': np.abs, 'sqrt': np.sqrt, 'exp': np.exp,
-                'log': np.log, 'log10': np.log10,
-                'pi': np.pi, 'e': np.e,
-                'arcsin': np.arcsin, 'arccos': np.arccos, 'arctan': np.arctan,
-                'clip': np.clip, 'sign': np.sign,
-            }
-            safe_ns.update(var_arrays)
-
             try:
-                result = eval(eval_expr, safe_ns)  # noqa: S307
-                result = np.asarray(result, dtype=float)
-                if result.shape != expr_x.shape:
-                    result = np.broadcast_to(result, expr_x.shape).copy()
+                new_idx = self._add_expression_series(expr_text)
             except Exception as exc:
                 QtWidgets.QMessageBox.warning(dlg, 'Expression Error',
                     f'Failed to evaluate expression:\n{exc}')
                 return
 
-            # Create a new computed series and add to series_list
             expr_label = expr_text
-            new_idx = len(self.series_list)
-            self.series_list.append((expr_label, lambda x, f, _d=result: _d, expr_x))
-
-            # Track in loaded files (add to a virtual "Expressions" file entry)
-            expr_file = None
-            for fe in self._loaded_files:
-                if fe['name'] == '(Expressions)':
-                    expr_file = fe
-                    break
-            if expr_file is None:
-                expr_file = {'name': '(Expressions)', 'series_indices': []}
-                self._loaded_files.append(expr_file)
-            expr_file['series_indices'].append(new_idx)
+            expr_file = next(fe for fe in self._loaded_files if fe['name'] == '(Expressions)')
             series_to_file[new_idx] = self._loaded_files.index(expr_file)
 
             # Also add to the tabs if using tabs (add a new tab if needed)
@@ -2852,8 +3155,7 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 new_y = 1
 
-            if new_y < 1:
-                new_y = 1
+            new_y = max(new_y, 1)
             item.setData(ROLE_YAXIS, new_y)
             _refresh_plotted_item_text(item)
 
@@ -2973,7 +3275,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     props.append(p)
                 else:
                     name = self.series_list[sidx][0]
-                    props.append({'label': name, 'color': '', 'linewidth': 1.5, 'linestyle': '', 'marker': '', 'yaxis': yaxis_value})
+                    marker = self.default_plot_style.get('marker', '') if default_marker is None else default_marker
+                    props.append({'label': name, 'color': '', 'linewidth': 1.5, 'linestyle': '', 'marker': marker, 'yaxis': yaxis_value})
             axes_labels = dict(initial_axes) if initial_axes else {'xlabel': '', 'ylabel_primary': '', 'ylabel_secondary': ''}
             on_accept(plotted_indices, props, axes_labels)
             dlg.accept()
@@ -3038,7 +3341,8 @@ class MainWindow(QtWidgets.QMainWindow):
             existing_axes = {}
             if ax_index < len(self.subplot_axes_labels):
                 existing_axes = self.subplot_axes_labels[ax_index]
-            self._open_series_editor(initial_plotted=self.subplot_series[ax_index], on_accept=_on_accept, initial_props=existing_props, initial_axes=existing_axes)
+            cfg = self.subplot_config[ax_index] if ax_index < len(self.subplot_config) else self.default_plot_style
+            self._open_series_editor(initial_plotted=self.subplot_series[ax_index], on_accept=_on_accept, initial_props=existing_props, initial_axes=existing_axes, default_marker=cfg.get('marker', ''))
             return
 
         # Right-click: show context menu for subplot actions
@@ -3275,7 +3579,7 @@ def main():
     parser.add_argument(
         'files', nargs='*', metavar='FILE',
         help='Data files to open on startup.\nCSV and SMV files are loaded directly.\n'
-             'BLF, TRC, and ASC files must be provided together with one or more DBC files.',
+             'BLF, TRC, and ASC files prompt for DBC files if none are provided.',
     )
     args = parser.parse_args()
 

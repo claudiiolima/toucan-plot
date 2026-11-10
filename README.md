@@ -19,11 +19,15 @@ An interactive PySide6 + Matplotlib plotting tool for CSV, SMV, and CAN bus log 
 | `.dbc`           | CAN database for signal decoding (required with BLF/TRC/ASC) |
 
 - Auto-detects `Time` / `timestamp` columns as the default X axis
-- CAN signals are forward-fill interpolated and named as `Message.Signal`
+- Opening or merging a CAN log without DBC files prompts you to select one or more DBC files, or reuse those from the previous CAN log in the current session
+- CAN signals are named as `Message.Signal` and plotted at their own receive timestamps; markers represent decoded samples
+- CAN expressions use a shared, forward-filled timeline to align signals for calculations
+- Loading or merging a CAN log opens a statistics window with duration, frame counts, decoding results, and errors
 
 ### Plot Interaction
 
 - **Shared X axis** across all subplots with linked panning and zooming
+- Loading files fits X and every Y axis to the plotted data, including when saved plot settings are restored
 - **Secondary Y axis** support per series
 - **Double-click** a subplot to edit its series, or **right-click** for a context menu
 - **Measure cursors** — two draggable vertical cursors with a live delta table
@@ -53,7 +57,7 @@ An interactive PySide6 + Matplotlib plotting tool for CSV, SMV, and CAN bus log 
 - **File → Open** (`Ctrl+O`) — open one or more files (multi-select)
 - **File → Merge** (`Ctrl+M`) — append files to the current session
 - **Style → Customize plot style** — preset, line mode, marker, text size, grid, legend
-- **Style → Theme** — Dark / Light (icons swap automatically)
+- **Style → Theme** — Dark / Light (canvas, axes, legends, palettes, and icons follow the theme)
 
 ### Right-Click Context Menu
 
@@ -63,6 +67,8 @@ An interactive PySide6 + Matplotlib plotting tool for CSV, SMV, and CAN bus log 
 - Line style: plot / step
 
 ### Style Presets
+
+Changing a preset or theme reapplies its color palette to all plotted series in every subplot. Dark mode uses brighter palettes, including when restoring saved plot settings.
 
 Four built-in presets: **Default**, **Style 1**, **IEEE**, **Other**.
 

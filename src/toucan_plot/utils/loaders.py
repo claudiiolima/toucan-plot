@@ -1,9 +1,11 @@
-import os
 import csv
-import numpy as np
+import os
+
 import can
 import cantools
+import numpy as np
 from asammdf import MDF
+
 
 def detect_delimiter(path):
     with open(path, 'r') as f:
@@ -66,7 +68,7 @@ def _can_reader(path):
     if ext == '.trc':
         return can.TRCReader(path)
     if ext == '.asc':
-        return can.ASCReader(path)
+        return can.ASCReader(path, relative_timestamp=False)
     return can.BLFReader(path)
 
 
@@ -81,28 +83,50 @@ def can_log_load_worker(blf_path, dbc_paths, queue):
         queue.put(('progress', 10, 'Reading CAN messages...'))
         signal_data = {}
         msg_count = 0
+        stats = dict(decoded_frames=0, unknown_id_frames=0, decode_error_frames=0,
+                     error_frames=0, remote_frames=0)
+        frame_ids = set()
+        channels = set()
+        first_timestamp = None
+        last_timestamp = None
 
         with _can_reader(blf_path) as reader:
             for msg in reader:
+                msg_count += 1
+                if msg_count % 5000 == 0:
+                    queue.put(('progress', -1, f'Reading messages... ({msg_count} processed)'))
+                if first_timestamp is None:
+                    first_timestamp = last_timestamp = msg.timestamp
+                else:
+                    first_timestamp = min(first_timestamp, msg.timestamp)
+                    last_timestamp = max(last_timestamp, msg.timestamp)
+                if msg.channel is not None:
+                    channels.add(msg.channel)
+                # Error frames and remote requests do not carry valid signal data.
+                if msg.is_error_frame:
+                    stats['error_frames'] += 1
+                    continue
+                frame_ids.add((msg.arbitration_id, msg.is_extended_id))
+                if msg.is_remote_frame:
+                    stats['remote_frames'] += 1
+                    continue
                 try:
                     db_msg = db.get_message_by_frame_id(msg.arbitration_id)
                 except KeyError:
-                    msg_count += 1
+                    stats['unknown_id_frames'] += 1
                     continue
                 try:
                     decoded = db_msg.decode(msg.data, decode_choices=False)
                 except Exception:
-                    msg_count += 1
+                    stats['decode_error_frames'] += 1
                     continue
+                stats['decoded_frames'] += 1
                 t = msg.timestamp
                 for signal_name, value in decoded.items():
                     full_name = f"{db_msg.name}.{signal_name}"
                     if full_name not in signal_data:
                         signal_data[full_name] = []
                     signal_data[full_name].append((t, float(value)))
-                msg_count += 1
-                if msg_count % 5000 == 0:
-                    queue.put(('progress', -1, f'Reading messages... ({msg_count} processed)'))
 
         if not signal_data:
             queue.put(('error', 'No CAN messages could be decoded with the provided DBC file(s).'))
@@ -121,10 +145,15 @@ def can_log_load_worker(blf_path, dbc_paths, queue):
 
         queue.put(('progress', 70, 'Building signal arrays...'))
         all_columns = {'Time': x_array}
+        can_samples = {}
         sorted_names = sorted(signal_data.keys())
         total_signals = len(sorted_names)
         for sig_idx, full_name in enumerate(sorted_names):
-            pairs = signal_data[full_name]
+            pairs = sorted(signal_data[full_name], key=lambda pair: pair[0])
+            can_samples[full_name] = (
+                np.array([t - t0 for t, _ in pairs]),
+                np.array([value for _, value in pairs]),
+            )
             data = np.full(len(x_array), np.nan)
             for t, val in pairs:
                 data[time_index[t]] = val
@@ -140,7 +169,12 @@ def can_log_load_worker(blf_path, dbc_paths, queue):
             if (sig_idx + 1) % 10 == 0 or sig_idx == total_signals - 1:
                 queue.put(('progress', pct, f'Processing signal {sig_idx + 1}/{total_signals}...'))
 
-        queue.put(('result', ('Time', all_columns)))
+        stats.update(total_frames=msg_count, unique_ids=len(frame_ids),
+                     channels=sorted(channels), duration=last_timestamp - first_timestamp,
+                     decoded_signals=total_signals)
+        queue.put(('can_samples', can_samples))
+        queue.put(('can_statistics', stats))
+        queue.put(('result', ('Time', all_columns, t0)))
     except Exception as e:
         queue.put(('error', str(e)))
 
